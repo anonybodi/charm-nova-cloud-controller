@@ -15,51 +15,53 @@
 from collections import OrderedDict
 from mock import patch, MagicMock, call
 
-from unit_tests.test_utils import (
+from test_utils import (
     CharmTestCase,
+    get_default_config,
     patch_open,
 )
 
-import hooks.nova_cc_utils as utils
+__default_config = get_default_config()
 
+with patch('charmhelpers.core.hookenv.config') as config:
+    with patch('charmhelpers.contrib.openstack.utils.get_os_codename_package'):  # noqa
+        # this makes the config behave more similar to the real config()
+        config.side_effect = lambda k: __default_config[k]
+
+        import nova_cc_utils as utils
 
 TO_PATCH = [
-    'charmhelpers.contrib.openstack.ip.canonical_url',
-    'charmhelpers.contrib.openstack.utils.configure_installation_source',
-    'charmhelpers.contrib.openstack.utils.enable_memcache',
-    'charmhelpers.contrib.openstack.utils.get_os_codename_install_source',
-    'charmhelpers.contrib.openstack.utils.is_unit_paused_set',
-    'charmhelpers.contrib.openstack.utils.os_application_version_set',
-    'charmhelpers.contrib.openstack.utils.os_release',
-    'charmhelpers.contrib.openstack.utils.save_script_rc',
-    'charmhelpers.contrib.openstack.utils.token_cache_pkgs',
-    'charmhelpers.contrib.peerstorage.peer_store',
-    'charmhelpers.core.hookenv.config',
-    'charmhelpers.core.hookenv.is_leader',
-    'charmhelpers.core.hookenv.leader_get',
-    'charmhelpers.core.hookenv.leader_set',
-    'charmhelpers.core.hookenv.local_unit',
-    'charmhelpers.core.hookenv.log',
-    'charmhelpers.core.hookenv.related_units',
-    'charmhelpers.core.hookenv.relation_get',
-    'charmhelpers.core.hookenv.relation_ids',
-    'charmhelpers.core.hookenv.remote_unit',
-    'charmhelpers.core.hookenv.status_set',
-    'charmhelpers.core.host.lsb_release',
-    'charmhelpers.core.host.service_pause',
-    'charmhelpers.core.host.service_restart',
-    'charmhelpers.core.host.service_resume',
-    'charmhelpers.core.host.service_running',
-    'charmhelpers.core.host.service_start',
-    'charmhelpers.core.host.service_stop',
-    'charmhelpers.fetch.apt_install',
-    'charmhelpers.fetch.apt_update',
-    'charmhelpers.fetch.apt_upgrade',
+    'apt_update',
+    'apt_upgrade',
+    'apt_install',
+    'config',
+    'configure_installation_source',
     'disable_policy_rcd',
+    'is_leader',
+    'is_unit_paused_set',
+    'lsb_release',
     'enable_policy_rcd',
-    'hooks.nova_cc_utils.register_configs',
-    'hooks.nova_cc_utils.services',
-    'uuid.uuid1',
+    'get_os_codename_install_source',
+    'log',
+    'os_release',
+    'peer_store',
+    'register_configs',
+    'relation_ids',
+    'remote_unit',
+    '_save_script_rc',
+    'service_pause',
+    'service_resume',
+    'service_start',
+    'services',
+    'service_running',
+    'service_stop',
+    'related_units',
+    'local_unit',
+    'relation_get',
+    'os_application_version_set',
+    'token_cache_pkgs',
+    'enable_memcache',
+    'status_set',
 ]
 
 SCRIPTRC_ENV_VARS = {
@@ -97,29 +99,6 @@ BASE_ENDPOINTS = {
     's3_service': 's3'
 }
 
-QUEENS_ENDPOINTS = {
-    'ec2_admin_url': None,
-    'ec2_internal_url': None,
-    'ec2_public_url': None,
-    'ec2_region': None,
-    'ec2_service': None,
-    'nova_admin_url': 'http://foohost.com:8774/v2.1',
-    'nova_internal_url': 'http://foohost.com:8774/v2.1',
-    'nova_public_url': 'http://foohost.com:8774/v2.1',
-    'nova_region': 'RegionOne',
-    'nova_service': 'nova',
-    's3_admin_url': None,
-    's3_internal_url': None,
-    's3_public_url': None,
-    's3_region': None,
-    's3_service': None,
-    'placement_region': 'RegionOne',
-    'placement_service': 'placement',
-    'placement_admin_url': 'http://foohost.com:8778',
-    'placement_internal_url': 'http://foohost.com:8778',
-    'placement_public_url': 'http://foohost.com:8778',
-}
-
 # Restart map should be constructed such that API services restart
 # before frontends (haproxy/apache) to avoid port conflicts.
 RESTART_MAP_ICEHOUSE = OrderedDict([
@@ -135,34 +114,26 @@ RESTART_MAP_ICEHOUSE = OrderedDict([
 ])
 RESTART_MAP_OCATA_ACTUAL = OrderedDict([
     ('/etc/nova/nova.conf', [
-        'nova-api-os-compute', 'nova-scheduler', 'nova-conductor', 'apache2',
+        'nova-api-ec2', 'nova-api-os-compute', 'nova-objectstore',
+        'nova-cert', 'nova-scheduler', 'nova-conductor', 'apache2'
     ]),
-    ('/etc/nova/api-paste.ini', ['nova-api-os-compute', 'apache2']),
+    ('/etc/nova/api-paste.ini', [
+        'nova-api-ec2', 'nova-api-os-compute', 'apache2'
+    ]),
     ('/etc/haproxy/haproxy.cfg', ['haproxy']),
     ('/etc/apache2/sites-available/openstack_https_frontend', ['apache2']),
-    ('/etc/apache2/sites-enabled/wsgi-placement-api.conf', ['apache2']),
+    ('/etc/apache2/sites-enabled/wsgi-openstack-api.conf', ['apache2']),
 ])
 RESTART_MAP_OCATA_BASE = OrderedDict([
     ('/etc/nova/nova.conf', [
-        'nova-api-os-compute', 'nova-placement-api',
-        'nova-scheduler', 'nova-conductor'
+        'nova-api-ec2', 'nova-api-os-compute', 'nova-placement-api',
+        'nova-objectstore', 'nova-cert', 'nova-scheduler', 'nova-conductor'
     ]),
     ('/etc/nova/api-paste.ini', [
-        'nova-api-os-compute', 'nova-placement-api'
+        'nova-api-ec2', 'nova-api-os-compute', 'nova-placement-api'
     ]),
     ('/etc/haproxy/haproxy.cfg', ['haproxy']),
     ('/etc/apache2/sites-available/openstack_https_frontend', ['apache2'])
-])
-RESTART_MAP_ROCKY_ACTUAL = OrderedDict([
-    ('/etc/nova/nova.conf', [
-        'nova-scheduler', 'nova-conductor', 'apache2',
-    ]),
-    ('/etc/nova/api-paste.ini', ['apache2']),
-    ('/etc/haproxy/haproxy.cfg', ['haproxy']),
-    ('/etc/apache2/sites-available/openstack_https_frontend', ['apache2']),
-    ('/etc/apache2/sites-enabled/wsgi-api-os-compute.conf', ['apache2']),
-    ('/etc/apache2/sites-enabled/wsgi-placement-api.conf', ['apache2']),
-    ('/etc/apache2/sites-enabled/wsgi-openstack-metadata.conf', ['apache2']),
 ])
 
 
@@ -200,51 +171,19 @@ ubuntu-cloud-archive/liberty-staging/ubuntu trusty main
 %s
 """ % GPG_PPA_CLOUD_ARCHIVE
 
-NM_CELLS_LIST = b"""
-+-------+--------------------------------------+--------------+-------------+
-| Name  | UUID                                 | Transport    | DB          |
-+-------+--------------------------------------+--------------+-------------+
-| cell0 | 00000000-0000-0000-0000-000000000000 | none:///     | mysql_cell0 |
-| cell1 | 7a8a0e58-e127-4056-bb98-99d9579ca08b | rabbit_cell1 | mysql_cell1 |
-+-------+--------------------------------------+--------------+-------------+
-"""
-
 
 class NovaCCUtilsTests(CharmTestCase):
 
     def setUp(self):
         super(NovaCCUtilsTests, self).setUp(utils, TO_PATCH)
         self.config.side_effect = self.test_config.get
-        utils._BASE_RESOURCE_MAP = None  # reset this for each test
         self.maxDiff = None
 
-    def test_resolve_services(self):
-        # Icehouse with disable-aws-compat = True
-        self.test_config.set('disable-aws-compat', True)
-        self.os_release.return_value = "icehouse"
-        _services = utils.resolve_services()
-        for _service in utils.AWS_COMPAT_SERVICES:
-            self.assertTrue(_service not in _services)
-
-        # Icehouse with disable-aws-compat = False
-        self.test_config.set('disable-aws-compat', False)
-        self.os_release.return_value = "icehouse"
-        _services = utils.resolve_services()
-        for _service in utils.AWS_COMPAT_SERVICES:
-            self.assertTrue(_service in _services)
-
-        # Liberty
-        self.os_release.return_value = "liberty"
-        _services = utils.resolve_services()
-        for _service in utils.AWS_COMPAT_SERVICES:
-            self.assertTrue(_service not in _services)
-
-        # Newton
-        self.os_release.return_value = "newton"
-        _services = utils.resolve_services()
-        for _service in utils.AWS_COMPAT_SERVICES:
-            self.assertTrue(_service not in _services)
-        self.assertTrue('nova-cert' not in _services)
+    def _resource_map(self):
+        with patch('charmhelpers.contrib.openstack.context.'
+                   'SubordinateConfigContext'):
+            _map = utils.resource_map()
+            return _map
 
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
     def test_resource_map_vmware(self, subcontext):
@@ -263,6 +202,7 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
     def test_resource_map_neutron_no_agent_installed(self, subcontext):
         self.os_release.return_value = 'diablo'
+        self._resource_map()
         _map = utils.resource_map()
         services = []
         [services.extend(_map[c]['services'])for c in _map]
@@ -302,19 +242,19 @@ class NovaCCUtilsTests(CharmTestCase):
 
     def test_console_attributes_none(self):
         self.test_config.set('console-access-protocol', 'None')
-        _proto = utils.common.console_attributes('protocol')
+        _proto = utils.console_attributes('protocol')
         self.assertEqual(_proto, None)
         self.test_config.set('console-access-protocol', 'NONE')
-        _proto = utils.common.console_attributes('protocol')
+        _proto = utils.console_attributes('protocol')
         self.assertEqual(_proto, None)
         self.test_config.set('console-access-protocol', 'none')
-        _proto = utils.common.console_attributes('protocol')
+        _proto = utils.console_attributes('protocol')
         self.assertEqual(_proto, None)
         self.test_config.set('console-access-protocol', None)
-        _proto = utils.common.console_attributes('protocol')
+        _proto = utils.console_attributes('protocol')
         self.assertEqual(_proto, None)
         self.test_config.set('console-access-protocol', "")
-        _proto = utils.common.console_attributes('protocol')
+        _proto = utils.console_attributes('protocol')
         self.assertEqual(_proto, None)
 
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
@@ -327,15 +267,26 @@ class NovaCCUtilsTests(CharmTestCase):
         for service in console_services:
             self.assertIn(service, _map['/etc/nova/nova.conf']['services'])
 
+    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
+    def test_resource_map_single_nova_consoleauth(self, subcontext):
+        self.test_config.set('console-access-protocol', 'spice')
+        self.test_config.set('single-nova-consoleauth', True)
+        self.os_release.return_value = 'ocata'
+        self.relation_ids.return_value = ['ha']
+        _map = utils.resource_map()
+        self.assertNotIn('nova-consoleauth',
+                         _map['/etc/nova/nova.conf']['services'])
+
     @patch('charmhelpers.contrib.openstack.neutron.os_release')
     @patch('os.path.exists')
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_restart_map_api_before_frontends_icehouse(
-            self, subcontext, _exists, _os_release):
+    def test_restart_map_api_before_frontends_icehouse(self, subcontext,
+                                                       _exists, _os_release):
         _os_release.return_value = 'icehouse'
         self.os_release.return_value = 'icehouse'
         _exists.return_value = False
         self.enable_memcache.return_value = False
+        self._resource_map()
         _map = utils.restart_map()
         self.assertIsInstance(_map, OrderedDict)
         self.assertEqual(_map, RESTART_MAP_ICEHOUSE)
@@ -343,12 +294,13 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch('charmhelpers.contrib.openstack.neutron.os_release')
     @patch('os.path.exists')
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_restart_map_api_actual_ocata(
-            self, subcontext, _exists, _os_release):
+    def test_restart_map_api_actual_ocata(self, subcontext,
+                                          _exists, _os_release):
         _os_release.return_value = 'ocata'
         self.os_release.return_value = 'ocata'
         _exists.return_value = False
         self.enable_memcache.return_value = False
+        self._resource_map()
         _map = utils.restart_map()
         self.assertIsInstance(_map, OrderedDict)
         self.assertEqual(_map, RESTART_MAP_OCATA_ACTUAL)
@@ -356,25 +308,13 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch('charmhelpers.contrib.openstack.neutron.os_release')
     @patch('os.path.exists')
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_restart_map_api_actual_rocky(
-            self, subcontext, _exists, _os_release):
-        _os_release.return_value = 'rocky'
-        self.os_release.return_value = 'rocky'
-        _exists.return_value = False
-        self.enable_memcache.return_value = False
-        _map = utils.restart_map()
-        self.assertIsInstance(_map, OrderedDict)
-        self.assertEqual(_map, RESTART_MAP_ROCKY_ACTUAL)
-
-    @patch('charmhelpers.contrib.openstack.neutron.os_release')
-    @patch('os.path.exists')
-    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_restart_map_api_ocata_base(
-            self, subcontext, _exists, _os_release):
+    def test_restart_map_api_ocata_base(self, subcontext,
+                                        _exists, _os_release):
         _os_release.return_value = 'ocata'
         self.os_release.return_value = 'ocata'
         _exists.return_value = False
         self.enable_memcache.return_value = False
+        self._resource_map()
         _map = utils.restart_map(actual_services=False)
         self.assertIsInstance(_map, OrderedDict)
         self.assertEqual(_map, RESTART_MAP_OCATA_BASE)
@@ -382,54 +322,31 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
     @patch('os.path.exists')
     def test_restart_map_apache24(self, _exists, subcontext):
-        _exists.return_value = True
+        _exists.return_Value = True
         self.os_release.return_value = 'diablo'
+        self._resource_map()
         _map = utils.restart_map()
         self.assertTrue('/etc/apache2/sites-available/'
                         'openstack_https_frontend.conf' in _map)
         self.assertTrue('/etc/apache2/sites-available/'
                         'openstack_https_frontend' not in _map)
 
-    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    @patch('os.path.exists')
-    @patch('os.path.isdir')
-    def test_restart_map_ssl(self, _isdir, _exists, subcontext):
-        _exists.return_value = True
-        _isdir.return_value = True
-        self.os_release.return_value = 'diablo'
-        _map = utils.restart_map()
-        self.assertTrue('/etc/apache2/ssl/nova/*' in _map)
-        _isdir.return_value = False
-        _map = utils.restart_map()
-        self.assertTrue('/etc/apache2/ssl/nova/*' not in _map)
-
     def test_console_attributes_spice(self):
-        _proto = utils.common.console_attributes('protocol', proto='spice')
+        _proto = utils.console_attributes('protocol', proto='spice')
         self.assertEqual(_proto, 'spice')
 
     def test_console_attributes_vnc(self):
         self.test_config.set('console-access-protocol', 'vnc')
-        _proto = utils.common.console_attributes('protocol')
-        _servs = utils.common.console_attributes('services')
-        _pkgs = utils.common.console_attributes('packages')
-        _proxy_page = utils.common.console_attributes('proxy-page')
+        _proto = utils.console_attributes('protocol')
+        _servs = utils.console_attributes('services')
+        _pkgs = utils.console_attributes('packages')
+        _proxy_page = utils.console_attributes('proxy-page')
         vnc_pkgs = ['nova-novncproxy', 'nova-xvpvncproxy', 'nova-consoleauth']
         vnc_servs = ['nova-novncproxy', 'nova-xvpvncproxy', 'nova-consoleauth']
         self.assertEqual(_proto, 'vnc')
-        self.assertEqual(sorted(_servs), sorted(vnc_servs))
-        self.assertEqual(sorted(_pkgs), sorted(vnc_pkgs))
+        self.assertEqual(_servs, vnc_servs)
+        self.assertEqual(_pkgs, vnc_pkgs)
         self.assertEqual(_proxy_page, None)
-
-    def test_console_attributes_console_access_port(self):
-        self.test_config.set('console-access-port', '6080')
-        _proxy_port = utils.common.console_attributes('proxy-port', 'novnc')
-        self.assertEqual(_proxy_port, '6080')
-        self.test_config.set('console-access-port', '6081')
-        _proxy_port = utils.common.console_attributes('proxy-port', 'xvpvnc')
-        self.assertEqual(_proxy_port, '6081')
-        self.test_config.set('console-access-port', '6082')
-        _proxy_port = utils.common.console_attributes('proxy-port', 'spice')
-        self.assertEqual(_proxy_port, '6082')
 
     def test_database_setup(self):
         self.relation_ids.return_value = ['shared-db:12']
@@ -475,59 +392,23 @@ class NovaCCUtilsTests(CharmTestCase):
         self.enable_memcache.return_value = False
         pkgs = utils.determine_packages()
         ex = list(set(utils.BASE_PACKAGES + utils.BASE_SERVICES))
-        # nova-placement-api, et al, are purposely dropped unless it's ocata
+        # nova-placement-api is purposely dropped unless it's ocata
         ex.remove('nova-placement-api')
-        self.assertEqual(sorted(ex), sorted(pkgs))
+        self.assertEqual(ex, pkgs)
 
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_determine_packages_base_queens(self, subcontext):
+    def test_determine_packages_base_ocata(self, subcontext):
         self.relation_ids.return_value = []
-        self.os_release.return_value = 'queens'
+        self.os_release.return_value = 'ocata'
         self.token_cache_pkgs.return_value = []
         self.enable_memcache.return_value = False
         pkgs = utils.determine_packages()
         ex = list(set(utils.BASE_PACKAGES + utils.BASE_SERVICES))
-        # some packages still need to be removed
-        ex.remove('nova-cert')
-        ex.remove('nova-objectstore')
-        ex.remove('nova-api-ec2')
-        self.assertEqual(sorted(ex), sorted(pkgs))
+        self.assertEqual(ex, pkgs)
 
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_determine_packages_base_rocky(self, subcontext):
-        self.relation_ids.return_value = []
-        self.os_release.return_value = 'rocky'
-        self.token_cache_pkgs.return_value = []
-        self.enable_memcache.return_value = False
-        pkgs = utils.determine_packages()
-        ex = list(set([p for p in utils.BASE_PACKAGES + utils.BASE_SERVICES
-                      if not p.startswith('python-')] + utils.PY3_PACKAGES))
-        # some packages still need to be removed
-        ex.remove('libapache2-mod-wsgi')
-        ex.remove('nova-cert')
-        ex.remove('nova-objectstore')
-        ex.remove('nova-api-ec2')
-        self.assertEqual(sorted(ex), sorted(pkgs))
-
-    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_determine_packages_base_stein(self, subcontext):
-        self.relation_ids.return_value = []
-        self.os_release.return_value = 'stein'
-        self.token_cache_pkgs.return_value = []
-        self.enable_memcache.return_value = False
-        pkgs = utils.determine_packages()
-        ex = list(set([p for p in utils.BASE_PACKAGES + utils.BASE_SERVICES
-                      if not p.startswith('python-')] + utils.PY3_PACKAGES))
-        # some packages still need to be removed
-        ex.remove('libapache2-mod-wsgi')
-        ex.remove('nova-cert')
-        ex.remove('nova-objectstore')
-        ex.remove('nova-api-ec2')
-        ex.append('python3-mysqldb')
-        self.assertEqual(sorted(ex), sorted(pkgs))
-
-    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_determine_packages_serial_console(self, subcontext):
+    def test_determine_packages_serial_console(self,
+                                               subcontext):
         self.test_config.set('enable-serial-console', True)
         self.relation_ids.return_value = []
         self.os_release.return_value = 'juno'
@@ -537,7 +418,8 @@ class NovaCCUtilsTests(CharmTestCase):
             self.assertIn(console_pkg, pkgs)
 
     @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    def test_determine_packages_serial_console_icehouse(self, subcontext):
+    def test_determine_packages_serial_console_icehouse(self,
+                                                        subcontext):
         self.test_config.set('enable-serial-console', True)
         self.relation_ids.return_value = []
         self.os_release.return_value = 'icehouse'
@@ -545,20 +427,6 @@ class NovaCCUtilsTests(CharmTestCase):
         console_pkgs = ['nova-serialproxy', 'nova-consoleauth']
         for console_pkg in console_pkgs:
             self.assertNotIn(console_pkg, pkgs)
-
-    def test_determine_purge_packages(self):
-        'Ensure no packages are identified for purge prior to rocky'
-        self.os_release.return_value = 'queens'
-        self.assertEqual(utils.determine_purge_packages(), [])
-
-    def test_determine_purge_packages_rocky(self):
-        'Ensure python packages are identified for purge at rocky'
-        self.os_release.return_value = 'rocky'
-        self.assertEqual(utils.determine_purge_packages(),
-                         [p for p in utils.BASE_PACKAGES
-                          if p.startswith('python-')] +
-                         ['python-nova', 'python-memcache',
-                          'libapache2-mod-wsgi'])
 
     @patch.object(utils, 'restart_map')
     def test_determine_ports(self, restart_map):
@@ -573,14 +441,13 @@ class NovaCCUtilsTests(CharmTestCase):
     def test_save_script_rc_base(self):
         self.relation_ids.return_value = []
         utils.save_script_rc()
-        self.save_script_rc.called_with(**SCRIPTRC_ENV_VARS)
+        self._save_script_rc.called_with(**SCRIPTRC_ENV_VARS)
 
     @patch('charmhelpers.contrib.openstack.utils.lsb_release')
     def test_get_step_upgrade_source_target_liberty(self, lsb_release):
         self.lsb_release.return_value = {'DISTRIB_CODENAME': 'trusty'}
         lsb_release.return_value = {'DISTRIB_CODENAME': 'trusty'}
         self.get_os_codename_install_source.side_effect = self.originals[
-            'charmhelpers.contrib.openstack.utils.'
             'get_os_codename_install_source']
 
         # icehouse -> liberty
@@ -609,7 +476,6 @@ class NovaCCUtilsTests(CharmTestCase):
         lsb_release.return_value = {'DISTRIB_CODENAME': 'xenial'}
         self.os_release.return_value = 'mitaka'
         self.get_os_codename_install_source.side_effect = self.originals[
-            'charmhelpers.contrib.openstack.utils.'
             'get_os_codename_install_source']
 
         step_src = utils.get_step_upgrade_source(OS_ORIGIN_NEWTON_STAGING)
@@ -622,7 +488,6 @@ class NovaCCUtilsTests(CharmTestCase):
         lsb_release.return_value = {'DISTRIB_CODENAME': 'xenial'}
         self.os_release.return_value = 'mitaka'
         self.get_os_codename_install_source.side_effect = self.originals[
-            'charmhelpers.contrib.openstack.utils.'
             'get_os_codename_install_source']
 
         step_src = utils.get_step_upgrade_source("cloud:xenial-ocata")
@@ -635,7 +500,6 @@ class NovaCCUtilsTests(CharmTestCase):
         self.lsb_release.return_value = {'DISTRIB_CODENAME': 'trusty'}
         lsb_release.return_value = {'DISTRIB_CODENAME': 'trusty'}
         self.get_os_codename_install_source.side_effect = self.originals[
-            'charmhelpers.contrib.openstack.utils.'
             'get_os_codename_install_source']
         self.os_release.return_value = 'icehouse'
         step_src = utils.get_step_upgrade_source(OS_ORIGIN_LIBERTY_STAGING)
@@ -645,10 +509,10 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch.object(utils, 'ssh_known_host_key')
     @patch('subprocess.check_output')
     def test_add_known_host_exists(self, check_output, host_key, rm):
-        check_output.return_value = b'|1|= fookey'
+        check_output.return_value = '|1|= fookey'
         host_key.return_value = '|1|= fookey'
         with patch_open() as (_open, _file):
-            utils.add_known_host('foohost', 'aservice')
+            utils.add_known_host('foohost')
             self.assertFalse(rm.called)
             self.assertFalse(_file.write.called)
 
@@ -658,7 +522,7 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch('subprocess.check_output')
     def test_add_known_host_exists_outdated(
             self, check_output, host_key, rm, known_hosts):
-        check_output.return_value = b'|1|= fookey'
+        check_output.return_value = '|1|= fookey'
         host_key.return_value = '|1|= fookey_old'
         with patch_open() as (_open, _file):
             utils.add_known_host('foohost', None, None)
@@ -670,30 +534,50 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch('subprocess.check_output')
     def test_add_known_host_exists_added(
             self, check_output, host_key, rm, known_hosts):
-        check_output.return_value = b'|1|= fookey'
+        check_output.return_value = '|1|= fookey'
         host_key.return_value = None
         with patch_open() as (_open, _file):
             _file.write = MagicMock()
-            utils.add_known_host('foohost', 'aservice')
+            utils.add_known_host('foohost')
             self.assertFalse(rm.called)
             _file.write.assert_called_with('|1|= fookey\n')
 
-    @patch('os.path.isfile')
-    def test_keystone_ca_cert_b64(self, isfile):
-        isfile.return_value = True
-        with patch_open() as (_open, _file):
-            _file.readlines = MagicMock()
-            _file.write = MagicMock()
-            _file.read.return_value = b'mycert'
-            self.assertEqual(
-                utils.keystone_ca_cert_b64(),
-                'bXljZXJ0')
+    @patch('__builtin__.open')
+    @patch('os.mkdir')
+    @patch('os.path.isdir')
+    def test_ssh_directory_for_unit(self, isdir, mkdir, _open):
+        self.remote_unit.return_value = 'nova-compute/0'
+        isdir.return_value = False
+        self.assertEqual(utils.ssh_directory_for_unit(),
+                         '/etc/nova/compute_ssh/nova-compute')
+        self.assertIn([
+            call('/etc/nova/compute_ssh/nova-compute/authorized_keys', 'w'),
+            call('/etc/nova/compute_ssh/nova-compute/known_hosts', 'w')
+        ], _open.call_args_list)
+
+    @patch.object(utils, 'ssh_directory_for_unit')
+    def test_known_hosts(self, ssh_dir):
+        ssh_dir.return_value = '/tmp/foo'
+        self.assertEqual(utils.known_hosts(), '/tmp/foo/known_hosts')
+        ssh_dir.assert_called_with(None, None)
+        self.assertEqual(utils.known_hosts('bar'), '/tmp/foo/known_hosts')
+        ssh_dir.assert_called_with('bar', None)
+
+    @patch.object(utils, 'ssh_directory_for_unit')
+    def test_authorized_keys(self, ssh_dir):
+        ssh_dir.return_value = '/tmp/foo'
+        self.assertEqual(utils.authorized_keys(), '/tmp/foo/authorized_keys')
+        ssh_dir.assert_called_with(None, None)
+        self.assertEqual(
+            utils.authorized_keys('bar'),
+            '/tmp/foo/authorized_keys')
+        ssh_dir.assert_called_with('bar', None)
 
     @patch.object(utils, 'known_hosts')
     @patch('subprocess.check_call')
     def test_remove_host_key(self, check_call, known_hosts):
         known_hosts.return_value = '/tmp/known_hosts'
-        utils.remove_known_host('foo', 'aservice')
+        utils.remove_known_host('foo')
         check_call.assert_called_with([
             'ssh-keygen', '-f', known_hosts(), '-R', 'foo'])
 
@@ -702,15 +586,15 @@ class NovaCCUtilsTests(CharmTestCase):
         key = 'BBBBB3NzaC1yc2EBBBBDBQBBBBBBBQC27Us7lSjCpa7bumXBgc'
         with patch_open() as (_open, _file):
             _file.read.return_value = AUTHORIZED_KEYS
-            self.assertTrue(utils.ssh_authorized_key_exists(key, 'aservice'))
+            self.assertTrue(utils.ssh_authorized_key_exists(key))
 
     @patch.object(utils, 'authorized_keys')
     def test_ssh_authorized_key_doesnt_exist(self, keys):
-        key = 'xxxx'
+        key = ('xxxx')
         with patch_open() as (_open, _file):
             _file.read = MagicMock()
             _file.readreturn_value = AUTHORIZED_KEYS
-            self.assertFalse(utils.ssh_authorized_key_exists(key, 'aservice'))
+            self.assertFalse(utils.ssh_authorized_key_exists(key))
 
     @patch.object(utils, 'known_hosts')
     @patch.object(utils, 'authorized_keys')
@@ -729,19 +613,12 @@ class NovaCCUtilsTests(CharmTestCase):
         )
         isfile.return_value = True
         self.remote_unit.return_value = 'nova-compute/2'
-
-        _written = ""
-
-        def _writer(s):
-            nonlocal _written
-            _written += s
-
         with patch_open() as (_open, _file):
             _file.readlines = MagicMock()
-            _file.write.side_effect = _writer
+            _file.write = MagicMock()
             _file.readlines.return_value = AUTHORIZED_KEYS.split('\n')
             utils.ssh_compute_remove(removed_key)
-            self.assertEqual(_written, keys_removed)
+            _file.write.assert_called_with(keys_removed)
 
     def test_determine_endpoints_base(self):
         self.relation_ids.return_value = []
@@ -751,23 +628,15 @@ class NovaCCUtilsTests(CharmTestCase):
                                                       'http://foohost.com',
                                                       'http://foohost.com'))
 
-    def test_determine_endpoints_queens(self):
-        self.relation_ids.return_value = []
-        self.os_release.return_value = 'queens'
-        self.assertEqual(
-            QUEENS_ENDPOINTS, utils.determine_endpoints('http://foohost.com',
-                                                        'http://foohost.com',
-                                                        'http://foohost.com'))
-
     @patch.object(utils, 'known_hosts')
     @patch('subprocess.check_output')
     def test_ssh_known_host_key(self, _check_output, _known_hosts):
         _known_hosts.return_value = '/foo/known_hosts'
-        utils.ssh_known_host_key('test', 'aservice')
+        utils.ssh_known_host_key('test')
         _check_output.assert_called_with(
             ['ssh-keygen', '-f', '/foo/known_hosts',
              '-H', '-F', 'test'])
-        _known_hosts.assert_called_with('aservice', None)
+        _known_hosts.assert_called_with(None, None)
         utils.ssh_known_host_key('test', 'bar')
         _known_hosts.assert_called_with('bar', None)
 
@@ -777,19 +646,19 @@ class NovaCCUtilsTests(CharmTestCase):
         """On precise ssh-keygen does not error if host not found in file. So
          check charm processes empty output properly"""
         _known_hosts.return_value = '/foo/known_hosts'
-        _check_output.return_value = b''
-        key = utils.ssh_known_host_key('test', 'aservice')
+        _check_output.return_value = ''
+        key = utils.ssh_known_host_key('test')
         self.assertEqual(key, None)
 
     @patch.object(utils, 'known_hosts')
     @patch('subprocess.check_call')
     def test_remove_known_host(self, _check_call, _known_hosts):
         _known_hosts.return_value = '/foo/known_hosts'
-        utils.remove_known_host('test', 'aservice')
+        utils.remove_known_host('test')
         _check_call.assert_called_with(
             ['ssh-keygen', '-f', '/foo/known_hosts',
              '-R', 'test'])
-        _known_hosts.assert_called_with('aservice', None)
+        _known_hosts.assert_called_with(None, None)
         utils.remove_known_host('test', 'bar')
         _known_hosts.assert_called_with('bar', None)
 
@@ -999,37 +868,6 @@ class NovaCCUtilsTests(CharmTestCase):
         self.assertFalse(migrate_nova_databases.called)
         database_setup.assert_called_with(prefix='novaapi')
 
-    @patch.object(utils, 'online_data_migrations_if_needed')
-    @patch.object(utils, 'disable_package_apache_site')
-    @patch.object(utils, 'database_setup')
-    @patch.object(utils, 'get_step_upgrade_source')
-    @patch.object(utils, 'migrate_nova_databases')
-    @patch.object(utils, 'determine_packages')
-    def test_upgrade_queens_rocky(self, determine_packages,
-                                  migrate_nova_databases,
-                                  get_step_upgrade_source,
-                                  database_setup,
-                                  disable_package_apache_site,
-                                  online_data_migrations_if_needed):
-        "Simulate a call to do_openstack_upgrade() for queens->rocky"
-        self.test_config.set('openstack-origin', 'cloud:bionic-queens')
-        get_step_upgrade_source.return_value = None
-        self.os_release.return_value = 'queens'
-        self.get_os_codename_install_source.return_value = 'rocky'
-        self.is_leader.return_value = True
-        self.relation_ids.return_value = []
-        database_setup.return_value = False
-        utils.do_openstack_upgrade(self.register_configs())
-        self.apt_update.assert_called_with(fatal=True)
-        self.apt_upgrade.assert_called_with(options=DPKG_OPTS, fatal=True,
-                                            dist=True)
-        self.apt_install.assert_called_with(determine_packages(), fatal=True)
-        self.register_configs.assert_called_with(release='rocky')
-        self.assertFalse(migrate_nova_databases.called)
-        database_setup.assert_called_with(prefix='novaapi')
-        online_data_migrations_if_needed.assert_called_once()
-        disable_package_apache_site.assert_called_once()
-
     def test_guard_map_nova(self):
         self.relation_ids.return_value = []
         self.os_release.return_value = 'icehouse'
@@ -1083,116 +921,54 @@ class NovaCCUtilsTests(CharmTestCase):
 
     def test_service_guard_active_guard(self):
         '''Ensure services with incomplete interfaces are stopped'''
-        class MockContext(object):
-            called = False
-
-            def complete_contexts(self):
-                self.called = True
-                return ['interfacea']
-
-        _mc = MockContext()
+        contexts = MagicMock()
+        contexts.complete_contexts.return_value = ['interfacea']
         self.service_running.return_value = True
 
         @utils.service_guard({'test': ['interfacea', 'interfaceb']},
-                             _mc, True)
+                             contexts, True)
         def dummy_func():
             pass
         dummy_func()
         self.service_running.assert_called_with('test')
         self.service_stop.assert_called_with('test')
-        self.assertTrue(_mc.called)
+        self.assertTrue(contexts.complete_contexts.called)
 
     def test_service_guard_active_release(self):
         '''Ensure services with complete interfaces are not stopped'''
-        class MockContext(object):
-            called = False
-
-            def complete_contexts(self):
-                self.called = True
-                return ['interfacea', 'interfaceb']
-
-        _mc = MockContext()
+        contexts = MagicMock()
+        contexts.complete_contexts.return_value = ['interfacea',
+                                                   'interfaceb']
 
         @utils.service_guard({'test': ['interfacea', 'interfaceb']},
-                             _mc, True)
+                             contexts, True)
         def dummy_func():
             pass
-
         dummy_func()
         self.assertFalse(self.service_running.called)
         self.assertFalse(self.service_stop.called)
-        self.assertTrue(_mc.called)
+        self.assertTrue(contexts.complete_contexts.called)
 
-    def test_service_guard_active_with_guardmap_function_object(self):
-        class MockContext(object):
-            called = False
+    def _test_is_api_ready(self, tgt):
+        fake_config = MagicMock()
+        with patch.object(utils, 'incomplete_relation_data') as ird:
+            ird.return_value = (not tgt)
+            self.assertEqual(utils.is_api_ready(fake_config), tgt)
+            ird.assert_called_with(
+                fake_config, utils.REQUIRED_INTERFACES)
 
-            def complete_contexts(self):
-                self.called = True
-                return ['interfacea', 'interfaceb']
+    def test_is_api_ready_true(self):
+        self._test_is_api_ready(True)
 
-        _mc = MockContext()
-
-        def guard_map():
-            return {'test': ['interfacea', 'interfaceb']}
-
-        @utils.service_guard(guard_map, _mc, True)
-        def dummy_func():
-            pass
-
-        dummy_func()
-        self.assertFalse(self.service_running.called)
-        self.assertFalse(self.service_stop.called)
-        self.assertTrue(_mc.called)
-
-    def test_service_guard_active_with_contexts_function_object(self):
-        class MockContext(object):
-            called = False
-
-            def complete_contexts(self):
-                self.called = True
-                return ['interfacea', 'interfaceb']
-
-        _mc = MockContext()
-
-        def lmc():
-            return _mc
-
-        @utils.service_guard({'test': ['interfacea', 'interfaceb']}, lmc, True)
-        def dummy_func():
-            pass
-
-        dummy_func()
-        self.assertFalse(self.service_running.called)
-        self.assertFalse(self.service_stop.called)
-        self.assertTrue(_mc.called)
-
-    def test_service_guard_active_with_active_function_object(self):
-        class MockContext(object):
-            called = False
-
-            def complete_contexts(self):
-                self.called = True
-                return ['interfacea', 'interfaceb']
-
-        _mc = MockContext()
-
-        @utils.service_guard({'test': ['interfacea', 'interfaceb']},
-                             _mc, lambda: False)
-        def dummy_func():
-            pass
-
-        dummy_func()
-        self.assertFalse(self.service_running.called)
-        self.assertFalse(_mc.called)
+    def test_is_api_ready_false(self):
+        self._test_is_api_ready(False)
 
     def test_assess_status(self):
         with patch.object(utils, 'assess_status_func') as asf:
-            configs = MagicMock()
             callee = MagicMock()
             asf.return_value = callee
-            utils.assess_status(configs)
-            asf.assert_called_once_with(configs)
+            utils.assess_status('test-config')
+            asf.assert_called_once_with('test-config')
             callee.assert_called_once_with()
             self.os_application_version_set.assert_called_with(
                 utils.VERSION_PACKAGE
@@ -1203,7 +979,7 @@ class NovaCCUtilsTests(CharmTestCase):
     @patch.object(utils, 'REQUIRED_INTERFACES')
     @patch.object(utils, 'services')
     @patch.object(utils, 'determine_ports')
-    @patch.object(utils.ch_utils, 'make_assess_status_func')
+    @patch.object(utils, 'make_assess_status_func')
     def test_assess_status_func(self,
                                 make_assess_status_func,
                                 determine_ports,
@@ -1226,12 +1002,10 @@ class NovaCCUtilsTests(CharmTestCase):
     def test_pause_unit_helper(self):
         with patch.object(utils, '_pause_resume_helper') as prh:
             utils.pause_unit_helper('random-config')
-            prh.assert_called_once_with(utils.ch_utils.pause_unit,
-                                        'random-config')
+            prh.assert_called_once_with(utils.pause_unit, 'random-config')
         with patch.object(utils, '_pause_resume_helper') as prh:
             utils.resume_unit_helper('random-config')
-            prh.assert_called_once_with(utils.ch_utils.resume_unit,
-                                        'random-config')
+            prh.assert_called_once_with(utils.resume_unit, 'random-config')
 
     @patch.object(utils, 'services')
     @patch.object(utils, 'determine_ports')
@@ -1246,40 +1020,56 @@ class NovaCCUtilsTests(CharmTestCase):
             # ports=None whilst port checks are disabled.
             f.assert_called_once_with('assessor', services='s1', ports=None)
 
-    @patch('charmhelpers.fetch.filter_installed_packages')
-    def test_disable_aws_compat_services_uninstalled(
-            self, filter_installed_packages,):
+    @patch.object(utils, 'service_pause')
+    @patch.object(utils, 'service_resume')
+    @patch.object(utils, 'config')
+    @patch.object(utils, 'filter_installed_packages')
+    def test_disable_aws_compat_services_uinstalled(self,
+                                                    filter_installed_packages,
+                                                    config, service_resume,
+                                                    service_pause):
         filter_installed_packages.return_value = utils.AWS_COMPAT_SERVICES
         utils.update_aws_compat_services()
-        self.config.assert_not_called()
-        self.service_pause.assert_not_called()
-        self.service_resume.assert_not_called()
+        config.assert_not_called()
+        service_pause.assert_not_called()
+        service_resume.assert_not_called()
 
-    @patch('charmhelpers.fetch.filter_installed_packages')
-    def test_disable_aws_compat_services_true(self, filter_installed_packages):
+    @patch.object(utils, 'service_pause')
+    @patch.object(utils, 'service_resume')
+    @patch.object(utils, 'config')
+    @patch.object(utils, 'filter_installed_packages')
+    def test_disable_aws_compat_services_true(self, filter_installed_packages,
+                                              config, s_resume, s_pause):
         filter_installed_packages.return_value = []
-        self.test_config.set('disable-aws-compat', True)
+        config.return_value = True
         utils.update_aws_compat_services()
 
-        self.service_resume.assert_not_called()
-        self.service_pause.assert_has_calls(
-            [call(s) for s in utils.AWS_COMPAT_SERVICES])
+        s_resume.assert_not_called()
+        s_pause.assert_has_calls([call(s) for s in utils.AWS_COMPAT_SERVICES])
 
-    @patch('charmhelpers.fetch.filter_installed_packages')
-    def test_disable_aws_compat_services_false(
-            self, filter_installed_packages):
+    @patch.object(utils, 'service_pause')
+    @patch.object(utils, 'service_resume')
+    @patch.object(utils, 'config')
+    @patch.object(utils, 'filter_installed_packages')
+    def test_disable_aws_compat_services_false(self, filter_installed_packages,
+                                               config, s_resume, s_pause):
         filter_installed_packages.return_value = []
-        self.test_config.set('disable-aws-compat', False)
+        config.return_value = False
         utils.update_aws_compat_services()
 
-        self.service_resume.assert_has_calls(
-            [call(s) for s in utils.AWS_COMPAT_SERVICES])
-        self.service_pause.assert_not_called()
+        s_resume.assert_has_calls([call(s) for s in utils.AWS_COMPAT_SERVICES])
+        s_pause.assert_not_called()
 
     @patch('subprocess.check_output')
     def test_get_cell_uuid(self, mock_check_call):
-        mock_check_call.return_value = NM_CELLS_LIST
-        expected = '7a8a0e58-e127-4056-bb98-99d9579ca08b'
+        mock_check_call.return_value = ("""
+        +-------+--------------------------------------+
+        |  Name |                 UUID                 |
+        +-------+--------------------------------------+
+        | cell0 | 00000000-0000-0000-0000-000000000000 |
+        | cell1 | c83121db-f1c7-464a-b657-38c28fac84c6 |
+        +-------+--------------------------------------+""")
+        expected = 'c83121db-f1c7-464a-b657-38c28fac84c6'
         self.assertEqual(expected, utils.get_cell_uuid('cell1'))
 
     @patch.object(utils, 'get_cell_uuid')
@@ -1374,7 +1164,7 @@ class NovaCCUtilsTests(CharmTestCase):
         self.assertEqual(mock_popen.mock_calls, expectd_calls)
 
     @patch('subprocess.Popen')
-    def test_archive_deleted_rows_exception(self, mock_popen):
+    def test_archive_deleted_rows_excpetion(self, mock_popen):
         process_mock = MagicMock()
         attrs = {
             'communicate.return_value': ('output', 'error'),
@@ -1383,48 +1173,6 @@ class NovaCCUtilsTests(CharmTestCase):
         mock_popen.return_value = process_mock
         with self.assertRaises(Exception):
             utils.archive_deleted_rows()
-
-    def test_is_serial_console_enabled_on_juno(self):
-        self.os_release.return_value = 'juno'
-        self.test_config.set('enable-serial-console', True)
-        self.assertTrue(
-            utils.is_serial_console_enabled())
-
-    def test_is_serial_console_enabled_off_juno(self):
-        self.os_release.return_value = 'juno'
-        self.test_config.set('enable-serial-console', False)
-        self.assertFalse(
-            utils.is_serial_console_enabled())
-
-    def test_is_serial_console_enabled_on_icehouse(self):
-        self.os_release.return_value = 'icehouse'
-        self.test_config.set('enable-serial-console', True)
-        self.assertFalse(
-            utils.is_serial_console_enabled())
-
-    @patch.object(utils, 'is_serial_console_enabled')
-    def test_is_console_auth_enabled(self, is_serial_console_enabled):
-        is_serial_console_enabled.return_value = True
-        self.test_config.set('console-access-protocol', 'vnc')
-        self.assertTrue(
-            utils.is_console_auth_enabled())
-
-    @patch.object(utils, 'is_serial_console_enabled')
-    def test_is_console_auth_enabled_no_serial(self,
-                                               is_serial_console_enabled):
-        is_serial_console_enabled.return_value = False
-        self.test_config.set('console-access-protocol', 'vnc')
-        self.assertTrue(
-            utils.is_console_auth_enabled())
-
-    @patch.object(utils, 'is_serial_console_enabled')
-    def test_is_console_auth_enabled_no_serial_no_console(
-            self,
-            is_serial_console_enabled):
-        is_serial_console_enabled.return_value = False
-        self.test_config.set('console-access-protocol', None)
-        self.assertFalse(
-            utils.is_console_auth_enabled())
 
     @patch.object(utils, 'get_cell_uuid')
     @patch('subprocess.check_output')
@@ -1436,7 +1184,7 @@ class NovaCCUtilsTests(CharmTestCase):
             ['nova-manage', 'cell_v2', 'discover_hosts', '--cell_uuid',
              'c83121db-f1c7-464a-b657-38c28fac84c6', '--verbose'])
 
-    @patch('hooks.nova_cc_context.NovaCellV2SharedDBContext')
+    @patch('nova_cc_context.NovaCellV2SharedDBContext')
     @patch('charmhelpers.contrib.openstack.context.AMQPContext')
     def test_is_cellv2_init_ready_mitaka(self, amqp, shared_db):
         self.os_release.return_value = 'mitaka'
@@ -1446,7 +1194,7 @@ class NovaCCUtilsTests(CharmTestCase):
         shared_db.assert_called_once()
         self.log.assert_called_once()
 
-    @patch('hooks.nova_cc_context.NovaCellV2SharedDBContext')
+    @patch('nova_cc_context.NovaCellV2SharedDBContext')
     @patch('charmhelpers.contrib.openstack.context.AMQPContext')
     def test_is_cellv2_init_ready_ocata(self, amqp, shared_db):
         self.os_release.return_value = 'ocata'
@@ -1455,183 +1203,3 @@ class NovaCCUtilsTests(CharmTestCase):
         amqp.assert_called_once()
         shared_db.assert_called_once()
         self.log.assert_not_called()
-
-    def test_placement_api_enabled(self):
-        self.os_release.return_value = 'ocata'
-        self.assertTrue(utils.placement_api_enabled())
-        self.os_release.return_value = 'mitaka'
-        self.assertFalse(utils.placement_api_enabled())
-
-    def test_enable_metadata_api(self):
-        self.os_release.return_value = 'pike'
-        self.assertFalse(utils.enable_metadata_api())
-        self.os_release.return_value = 'rocky'
-        self.assertTrue(utils.enable_metadata_api())
-
-    def test_get_shared_metadatasecret(self):
-        self.leader_get.return_value = 'auuid'
-        self.assertEqual(utils.get_shared_metadatasecret(), 'auuid')
-
-    def test_set_shared_metadatasecret(self):
-        self.uuid1.return_value = 'auuid'
-        utils.set_shared_metadatasecret()
-        self.leader_set.assert_called_once_with({
-            'shared-metadata-secret': 'auuid'})
-
-    @patch.object(utils, 'get_shared_metadatasecret')
-    def test_get_metadata_settings(self, mock_get_shared_metadatasecret):
-        self.os_release.return_value = 'rocky'
-        self.canonical_url.return_value = 'http://someaddr'
-        mock_get_shared_metadatasecret.return_value = 'auuid'
-        self.assertEqual(
-            utils.get_metadata_settings('configs'),
-            {
-                'nova-metadata-host': 'someaddr',
-                'nova-metadata-port': 8775,
-                'nova-metadata-protocol': 'http',
-                'shared-metadata-secret': 'auuid'})
-
-    def test_get_metadata_settings_pike(self):
-        self.os_release.return_value = 'pike'
-        self.assertEqual(
-            utils.get_metadata_settings('configs'),
-            {})
-
-    @patch.object(utils.ch_context, 'SharedDBContext')
-    @patch('charmhelpers.core.hookenv.relation_id')
-    def test_get_cell_db_context(self, mock_relation_id, mock_SharedDBContext):
-        mock_relation_id.return_value = 'dbid'
-        utils.get_cell_db_context('mysql-cell2')
-        mock_SharedDBContext.assert_called_once_with(
-            relation_id='dbid',
-            relation_prefix='nova',
-            ssl_dir='/etc/nova')
-        mock_relation_id.assert_called_once_with(
-            relation_name='shared-db-cell',
-            service_or_unit='mysql-cell2')
-
-    @patch.object(utils.ch_context, 'AMQPContext')
-    @patch('charmhelpers.core.hookenv.relation_id')
-    def test_get_cell_amqp_context(self, mock_relation_id, mock_AMQPContext):
-        mock_relation_id.return_value = 'amqpid'
-        utils.get_cell_amqp_context('rabbitmq-server-cell2')
-        mock_AMQPContext.assert_called_once_with(
-            relation_id='amqpid',
-            ssl_dir='/etc/nova')
-        mock_relation_id.assert_called_once_with(
-            relation_name='amqp-cell',
-            service_or_unit='rabbitmq-server-cell2')
-
-    def test_get_sql_uri(self):
-        base_ctxt = {
-            'database_type': 'mysql',
-            'database_user': 'nova',
-            'database_password': 'novapass',
-            'database_host': '10.0.0.10',
-            'database': 'novadb'}
-        self.assertEqual(
-            utils.get_sql_uri(base_ctxt),
-            'mysql://nova:novapass@10.0.0.10/novadb')
-        sslca_ctxt = {'database_ssl_ca': 'myca'}
-        sslca_ctxt.update(base_ctxt)
-        self.assertEqual(
-            utils.get_sql_uri(sslca_ctxt),
-            'mysql://nova:novapass@10.0.0.10/novadb?ssl_ca=myca')
-        ssl_cert_ctxt = {
-            'database_ssl_cert': 'mycert',
-            'database_ssl_key': 'mykey'}
-        ssl_cert_ctxt.update(sslca_ctxt)
-        self.assertEqual(
-            utils.get_sql_uri(ssl_cert_ctxt),
-            ('mysql://nova:novapass@10.0.0.10/novadb?ssl_ca=myca&'
-             'ssl_cert=mycert&ssl_key=mykey'))
-
-    @patch.object(utils, 'is_db_initialised')
-    @patch.object(utils, 'get_cell_details')
-    @patch.object(utils, 'get_cell_db_context')
-    @patch.object(utils, 'get_cell_amqp_context')
-    @patch.object(utils, 'get_sql_uri')
-    @patch.object(utils.subprocess, 'check_output')
-    def test_update_child_cell(self,
-                               mock_check_output,
-                               mock_get_sql_uri,
-                               mock_get_cell_amqp_context,
-                               mock_get_cell_db_context,
-                               mock_get_cell_details,
-                               mock_is_db_initialised):
-        mock_is_db_initialised.return_value = True
-        mock_get_cell_details.return_value = {'cell1': 'cell1uuid'}
-        mock_get_cell_db_context.return_value = {'ctxt': 'a full context'}
-        mock_get_cell_amqp_context.return_value = {'transport_url': 'amqp-uri'}
-        mock_get_sql_uri.return_value = 'db-uri'
-        utils.update_child_cell('cell2', 'mysql-cell2', 'amqp-cell2')
-        mock_get_cell_amqp_context.assert_called_once_with('amqp-cell2')
-        mock_get_cell_db_context.assert_called_once_with('mysql-cell2')
-        mock_check_output.assert_called_once_with([
-            'nova-manage',
-            'cell_v2',
-            'create_cell',
-            '--verbose',
-            '--name', 'cell2',
-            '--transport-url', 'amqp-uri',
-            '--database_connection', 'db-uri'])
-        self.service_restart.assert_called_once_with('nova-scheduler')
-
-    @patch.object(utils, 'is_db_initialised')
-    @patch.object(utils.subprocess, 'check_output')
-    def test_update_child_cell_no_local_db(self,
-                                           mock_check_output,
-                                           mock_is_db_initialised):
-        mock_is_db_initialised.return_value = False
-        utils.update_child_cell('cell2', 'mysql-cell2', 'amqp-cell2')
-        self.assertFalse(mock_check_output.called)
-        self.assertFalse(self.service_restart.called)
-
-    @patch.object(utils, 'get_cell_details')
-    @patch.object(utils, 'is_db_initialised')
-    @patch.object(utils.subprocess, 'check_output')
-    def test_update_child_cell_api_cell_not_registered(self,
-                                                       mock_check_output,
-                                                       mock_is_db_initialised,
-                                                       mock_get_cell_details):
-        mock_is_db_initialised.return_value = True
-        mock_get_cell_details.return_value = {}
-        utils.update_child_cell('cell2', 'mysql-cell2', 'amqp-cell2')
-        mock_get_cell_details.assert_called_once_with()
-        self.assertFalse(mock_check_output.called)
-        self.assertFalse(self.service_restart.called)
-
-    @patch.object(utils.subprocess, 'check_output')
-    @patch.object(utils, 'get_cell_details')
-    @patch.object(utils, 'is_db_initialised')
-    @patch.object(utils, 'get_cell_db_context')
-    def test_update_child_cell_no_cell_db(self, mock_get_cell_db_context,
-                                          mock_is_db_initialised,
-                                          mock_get_cell_details,
-                                          mock_check_output):
-        mock_is_db_initialised.return_value = True
-        mock_get_cell_details.return_value = {'cell1': 'uuid4cell1'}
-        mock_get_cell_db_context.return_value = {}
-        utils.update_child_cell('cell2', 'mysql-cell2', 'amqp-cell2')
-        self.assertFalse(mock_check_output.called)
-        self.assertFalse(self.service_restart.called)
-
-    @patch.object(utils, 'get_cell_amqp_context')
-    @patch.object(utils, 'get_sql_uri')
-    @patch.object(utils.subprocess, 'check_output')
-    @patch.object(utils, 'get_cell_details')
-    @patch.object(utils, 'is_db_initialised')
-    @patch.object(utils, 'get_cell_db_context')
-    def test_update_child_cell_no_cell_amqp(self, mock_get_cell_db_context,
-                                            mock_is_db_initialised,
-                                            mock_get_cell_details,
-                                            mock_check_output,
-                                            mock_get_sql_uri,
-                                            mock_get_cell_amqp_context):
-        mock_is_db_initialised.return_value = True
-        mock_get_cell_details.return_value = {'cell1': 'uuid4cell1'}
-        mock_get_cell_db_context.return_value = {'ctxt': 'a full context'}
-        mock_get_cell_amqp_context.return_value = {}
-        utils.update_child_cell('cell2', 'mysql-cell2', 'amqp-cell2')
-        self.assertFalse(mock_check_output.called)
-        self.assertFalse(self.service_restart.called)

@@ -14,8 +14,6 @@
 
 import amulet
 import json
-import tempfile
-import os
 
 from charmhelpers.contrib.openstack.amulet.deployment import (
     OpenStackAmuletDeployment
@@ -27,10 +25,10 @@ from charmhelpers.contrib.openstack.amulet.utils import (
     # ERROR
 )
 from charmhelpers.contrib.openstack.utils import CompareOpenStackReleases
-from oslo_config import cfg
 
 import keystoneclient
 from keystoneclient.v3 import client as keystone_client_v3
+import glanceclient
 from novaclient import client as nova_client
 from novaclient import exceptions
 
@@ -57,7 +55,7 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
     """Amulet tests on a basic nova cloud controller deployment."""
 
     def __init__(self, series=None, openstack=None, source=None,
-                 stable=False):
+                 stable=True):
         """Deploy the entire test environment."""
         super(NovaCCBasicDeployment, self).__init__(series, openstack,
                                                     source, stable)
@@ -67,8 +65,8 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
         self._deploy()
 
         u.log.info('Waiting on extended status checks...')
-        self.exclude_services = []
-        self._auto_wait_for_status(exclude_services=self.exclude_services)
+        exclude_services = []
+        self._auto_wait_for_status(exclude_services=exclude_services)
 
         self.d.sentry.wait()
         self._initialize_tests()
@@ -81,8 +79,6 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
         )
         if cmp_os_release >= 'newton':
             services.remove('nova-cert')
-        if cmp_os_release >= 'rocky':
-            services.remove('nova-api-os-compute')
         u.get_unit_process_ids(
             {self.nova_cc_sentry: services},
             expect_success=should_run)
@@ -100,7 +96,7 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
             {'name': 'nova-compute', 'units': 2},
             {'name': 'keystone'},
             {'name': 'glance'},
-            self.get_percona_service_entry(),
+            {'name': 'percona-cluster', 'constraints': {'mem': '3072M'}},
         ]
         if self._get_openstack_release() >= self.xenial_ocata:
             other_ocata_services = [
@@ -123,6 +119,7 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
                                                    'cloud-compute',
             'nova-cloud-controller:image-service': 'glance:image-service',
             'nova-compute:image-service': 'glance:image-service',
+            'nova-compute:shared-db': 'percona-cluster:shared-db',
             'nova-compute:amqp': 'rabbitmq-server:amqp',
             'keystone:shared-db': 'percona-cluster:shared-db',
             'glance:identity-service': 'keystone:identity-service',
@@ -197,18 +194,8 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
             self.keystone_sentry,
             openstack_release=self._get_openstack_release())
 
-        force_v1_client = False
-        if self._get_openstack_release() == self.trusty_icehouse:
-            # Updating image properties (such as arch or hypervisor) using the
-            # v2 api in icehouse results in:
-            # https://bugs.launchpad.net/python-glanceclient/+bug/1371559
-            u.log.debug('Forcing glance to use v1 api')
-            force_v1_client = True
-
         # Authenticate admin with glance endpoint
-        self.glance = u.authenticate_glance_admin(
-            self.keystone,
-            force_v1_client=force_v1_client)
+        self.glance = glanceclient.Client('1', session=self.keystone_session)
 
         # Authenticate admin with nova endpoint
         self.nova = nova_client.Client(2, session=self.keystone_session)
@@ -308,7 +295,7 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
                                        'nova-network',
                                        'nova-api'],
             self.keystone_sentry: ['keystone'],
-            self.glance_sentry: ['glance-api']
+            self.glance_sentry: ['glance-registry', 'glance-api']
         }
         cmp_os_release = CompareOpenStackReleases(
             self._get_openstack_release_string()
@@ -326,10 +313,6 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
         if self._get_openstack_release() >= self.xenial_ocata:
             services[self.nova_compute_sentry].remove('nova-network')
             services[self.nova_compute_sentry].remove('nova-api')
-
-        if self._get_openstack_release() >= self.bionic_rocky:
-            services[self.nova_cc_sentry].remove('nova-api-os-compute')
-            services[self.nova_cc_sentry].append('apache2')
 
         ret = u.validate_services_by_name(services)
         if ret:
@@ -646,68 +629,195 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
             message = u.relation_error('glance image-service', ret)
             amulet.raise_status(amulet.FAIL, msg=message)
 
-    def test_220_nova_metadata_propagate(self):
-        """Verify that the setting vendor_data is propagated to nova-compute"""
+    def test_300_nova_default_config(self):
+        """Verify the data in the nova config file's default section."""
+        u.log.debug('Checking nova config file data...')
+        unit = self.nova_cc_sentry
+        conf = '/etc/nova/nova.conf'
 
-        os_release = self._get_openstack_release()
+        rmq_ncc_rel = self.rabbitmq_sentry.relation(
+            'amqp', 'nova-cloud-controller:amqp')
+
+        gl_ncc_rel = self.glance_sentry.relation(
+            'image-service', 'nova-cloud-controller:image-service')
+
+        # Since >= liberty endpoint_type was replaced by interface
+        # https://github.com/openstack/keystoneauth/commit/d227f6d237c4309b21a32a115fc5b09b9ba46ef0
+        try:
+            ks_ep = self.keystone.service_catalog.url_for(
+                service_type='identity', interface='publicURL')
+        except TypeError:
+            ks_ep = self.keystone.service_catalog.url_for(
+                service_type='identity', endpoint_type='publicURL')
+
+        ks_ec2 = "{}/ec2tokens".format(ks_ep)
+
+        ks_ncc_rel = self.keystone_sentry.relation(
+            'identity-service', 'nova-cloud-controller:identity-service')
+
+        ks_uri = "http://{}:{}/".format(ks_ncc_rel['service_host'],
+                                        ks_ncc_rel['service_port'])
+
+        id_uri = "{}://{}:{}/".format(ks_ncc_rel['auth_protocol'],
+                                      ks_ncc_rel['service_host'],
+                                      ks_ncc_rel['auth_port'])
+
+        db_ncc_rel = self.pxc_sentry.relation(
+            'shared-db', 'nova-cloud-controller:shared-db')
+
+        db_uri = "mysql://{}:{}@{}/{}".format('nova',
+                                              db_ncc_rel['nova_password'],
+                                              db_ncc_rel['db_host'],
+                                              'nova')
 
         expected = {
-            "vendordata_providers": "StaticJSON,DynamicJSON",
-            "vendordata_dynamic_targets": "http://example.org/vdata",
-            "vendordata_jsonfile_path": "/etc/nova/vendor_data.json",
+            'DEFAULT': {
+                'dhcpbridge_flagfile': '/etc/nova/nova.conf',
+                'dhcpbridge': '/usr/bin/nova-dhcpbridge',
+                'logdir': '/var/log/nova',
+                'state_path': '/var/lib/nova',
+                'force_dhcp_release': 'True',
+                'iscsi_helper': 'tgtadm',
+                'libvirt_use_virtio_for_bridges': 'True',
+                'connection_type': 'libvirt',
+                'root_helper': 'sudo nova-rootwrap /etc/nova/rootwrap.conf',
+                'verbose': 'False',
+                'debug': 'False',
+                'api_paste_config': '/etc/nova/api-paste.ini',
+                'volumes_path': '/var/lib/nova/volumes',
+                'auth_strategy': 'keystone',
+                'compute_driver': 'libvirt.LibvirtDriver',
+                'network_manager': 'nova.network.manager.FlatDHCPManager',
+                's3_listen_port': '3323',
+                'osapi_compute_listen_port': '8764',
+            }
         }
 
-        u.log.debug('Validating the config does not exist prior to test')
-        if self._get_openstack_release() < self.bionic_rocky:
-            sentries = [self.nova_compute_sentry]
+        if self._get_openstack_release() < self.trusty_kilo:
+            # Juno and earlier
+            expected['database'] = {
+                'connection': db_uri
+            }
+            expected['keystone_authtoken'] = {
+                'auth_uri': ks_uri,
+                'auth_host': ks_ncc_rel['service_host'],
+                'auth_port': ks_ncc_rel['auth_port'],
+                'auth_protocol': ks_ncc_rel['auth_protocol'],
+                'admin_tenant_name': ks_ncc_rel['service_tenant'],
+                'admin_user': ks_ncc_rel['service_username'],
+                'admin_password': ks_ncc_rel['service_password'],
+            }
+            expected['DEFAULT'].update({
+                'lock_path': '/var/lock/nova',
+                'libvirt_use_virtio_for_bridges': 'True',
+                'compute_driver': 'libvirt.LibvirtDriver',
+                'rabbit_userid': 'nova',
+                'rabbit_virtual_host': 'openstack',
+                'rabbit_password': rmq_ncc_rel['password'],
+                'rabbit_host': rmq_ncc_rel['hostname'],
+                'glance_api_servers': gl_ncc_rel['glance-api-server']
+            })
         else:
-            sentries = [self.nova_compute_sentry, self.nova_cc_sentry]
+            # Kilo and later
+            expected['database'] = {
+                'connection': db_uri,
+                'max_pool_size': u.not_null,
+            }
+            expected['glance'] = {
+                'api_servers': gl_ncc_rel['glance-api-server'],
+            }
+            expected['keystone_authtoken'] = {
+                'identity_uri': id_uri.rstrip('/'),
+                'auth_uri': ks_uri,
+                'admin_tenant_name': ks_ncc_rel['service_tenant'],
+                'admin_user': ks_ncc_rel['service_username'],
+                'admin_password': ks_ncc_rel['service_password'],
+                'signing_dir': '/var/cache/nova',
+            }
+            expected['osapi_v3'] = {
+                'enabled': 'True',
+            }
+            # due to worker multiplier changes and the way the unit changes
+            # depending on whether it is LXC or KVM, we can't actually guess
+            # the workers reliable.
+            expected['conductor'] = {
+                'workers': u.not_null,
+            }
+            expected['oslo_messaging_rabbit'] = {
+                'rabbit_userid': 'nova',
+                'rabbit_virtual_host': 'openstack',
+                'rabbit_password': rmq_ncc_rel['password'],
+                'rabbit_host': rmq_ncc_rel['hostname'],
+            }
+            expected['oslo_concurrency'] = {
+                'lock_path': '/var/lock/nova',
+            }
 
-        for sentry in sentries:
-            # Validate nova-cc and nova-compute don't have vendor_data set
-            if u.validate_config_data(
-                    sentry, "/etc/nova/nova.conf", "api", expected) is None:
-                amulet.raise_status(
-                    amulet.FAIL, msg="Matching config options were found in "
-                                     "nova.conf prior to the test.")
-                content = u.file_contents_safe(
-                    sentry, "/etc/nova/vendor_data.json", max_wait=4,
-                    fatal=False)
-                if content:
-                    amulet.raise_status(
-                        amulet.FAIL, msg="vendor_data.json exists with content"
-                                         "prior to test: {}.".format(content))
+        if self._get_openstack_release() >= self.xenial_queens:
+            expected['keystone_authtoken'] = {
+                'auth_uri': ks_uri.rstrip('/'),
+                'auth_url': id_uri.rstrip('/'),
+                'auth_type': 'password',
+                'project_domain_name': 'service_domain',
+                'user_domain_name': 'service_domain',
+                'project_name': 'services',
+                'username': ks_ncc_rel['service_username'],
+                'password': ks_ncc_rel['service_password'],
+                'signing_dir': '/var/cache/nova'
+            }
+        elif self._get_openstack_release() >= self.trusty_mitaka:
+            expected['keystone_authtoken'] = {
+                'auth_uri': ks_uri.rstrip('/'),
+                'auth_url': id_uri.rstrip('/'),
+                'auth_type': 'password',
+                'project_domain_name': 'default',
+                'user_domain_name': 'default',
+                'project_name': 'services',
+                'username': ks_ncc_rel['service_username'],
+                'password': ks_ncc_rel['service_password'],
+                'signing_dir': '/var/cache/nova'
+            }
+        elif self._get_openstack_release() >= self.trusty_liberty:
+            # Liberty
+            expected['keystone_authtoken'] = {
+                'auth_uri': ks_uri.rstrip('/'),
+                'auth_url': id_uri.rstrip('/'),
+                'auth_plugin': 'password',
+                'project_domain_id': 'default',
+                'user_domain_id': 'default',
+                'project_name': 'services',
+                'username': 'nova',
+                'password': ks_ncc_rel['service_password'],
+                'signing_dir': '/var/cache/nova',
+            }
 
-        config = {
-            'vendor-data': '{"good": "json"}',
-            'vendor-data-url': 'http://example.org/vdata',
-        }
-        u.log.debug('Setting nova-cloud-controller config {}'.format(config))
-        self.d.configure('nova-cloud-controller', config)
+        if self._get_openstack_release() < self.trusty_mitaka:
+            expected['DEFAULT'].update({
+                'ec2_private_dns_show_ip': 'True',
+                'enabled_apis': 'ec2,osapi_compute,metadata',
+                'keystone_ec2_url': ks_ec2,
+                'ec2_listen_port': '8763'
+            })
+        elif self._get_openstack_release() >= self.trusty_mitaka:
+            expected['DEFAULT'].update({
+                'enabled_apis': 'osapi_compute,metadata',
+            })
 
-        u.log.debug('Waiting for all units to get ready')
-        self.d.sentry.wait()
+        if self._get_openstack_release() >= self.xenial_ocata:
+            del expected['DEFAULT']['force_dhcp_release']
+            del expected['DEFAULT']['network_manager']
+            del expected['oslo_messaging_rabbit']
+            expected['DEFAULT']['transport_url'] = u.not_null
+            del expected['DEFAULT']['auth_strategy']
+            expected['api'] = {'auth_strategy': 'keystone'}
+            del expected['DEFAULT']['api_paste_config']
+            expected['wsgi'] = {'api_paste_config': '/etc/nova/api-paste.ini'}
 
-        u.log.debug('Validating the config has been applied and propagated')
-        for sentry in sentries:
-            # Validate config got propagated to nova-compute
-            output = u.validate_config_data(sentry, "/etc/nova/nova.conf",
-                                            "api", expected)
-
-            if output is not None and os_release >= self.xenial_queens:
-                amulet.raise_status(
-                    amulet.FAIL, msg="Matching config options "
-                                     "were not found in nova.conf. "
-                                     "Output: {}".format(output))
-            content = u.file_contents_safe(
-                sentry, "/etc/nova/vendor_data.json", max_wait=4, fatal=True)
-            if os_release >= self.xenial_queens:
-                if not content or content != '{"good": "json"}':
-                    amulet.raise_status(
-                        amulet.FAIL, msg="vendor_data.json content did not "
-                                         "match: {}.".format(content))
-
-        u.log.debug('Test 220 finished successfully')
+        for section, pairs in expected.iteritems():
+            ret = u.validate_config_data(unit, conf, section, pairs)
+            if ret:
+                message = "nova config error: {}".format(ret)
+                amulet.raise_status(amulet.FAIL, msg=message)
 
     def test_302_api_rate_limiting_is_enabled(self):
         """
@@ -757,33 +867,11 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
             section = "DEFAULT"
             key_name = "pci_alias"
 
-        CONF = cfg.CONF
-        opt_group = cfg.OptGroup(name=section)
-        pci_opts = [cfg.MultiStrOpt(key_name)]
-        CONF.register_group(opt_group)
-        CONF.register_opts(pci_opts, opt_group)
-
-        _pci_alias2 = {
-            "name": " Cirrus Logic ",
-            "capability_type": "pci",
-            "product_id": "0ff2",
-            "vendor_id": "10de",
-            "device_type": "type-PCI"}
-
-        _pci_alias_list = "[{}, {}]".format(
-            json.dumps(_pci_alias1, sort_keys=True),
-            json.dumps(_pci_alias2, sort_keys=True))
-
         unit = self.nova_cc_sentry
         conf = '/etc/nova/nova.conf'
-        u.log.debug('Setting pci-alias to {}'.format(json.dumps(
-            _pci_alias1,
-            sort_keys=True)))
         self.d.configure(
             'nova-cloud-controller',
             {'pci-alias': json.dumps(_pci_alias1, sort_keys=True)})
-
-        u.log.debug('Waiting for config change to take effect')
         self.d.sentry.wait()
         ret = u.validate_config_data(
             unit,
@@ -797,31 +885,7 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
                 section,
                 ret)
             amulet.raise_status(amulet.FAIL, msg=message)
-
-        u.log.debug('Setting pci-alias to {}'.format(_pci_alias_list))
-        self.d.configure(
-            'nova-cloud-controller',
-            {'pci-alias': _pci_alias_list})
-        u.log.debug('Waiting for config change to take effect')
-        self.d.sentry.wait()
-
-        f = tempfile.NamedTemporaryFile(delete=False)
-        f.write(unit.file_contents(conf))
-        f.close()
-        CONF(default_config_files=[f.name])
-        if CompareOpenStackReleases(os_release) >= 'ocata':
-            alias_entries = CONF.pci.alias
-        else:
-            alias_entries = CONF.DEFAULT.pci_alias
-        assert alias_entries[0] == (
-            '{"capability_type": "pci", "device_type": "type-PF", '
-            '"name": "IntelNIC", "product_id": "1111", "vendor_id": "8086"}')
-        assert alias_entries[1] == (
-            '{"capability_type": "pci", "device_type": "type-PCI", '
-            '"name": " Cirrus Logic ", "product_id": "0ff2", '
-            '"vendor_id": "10de"}')
         self.d.configure('nova-cloud-controller', {'pci-alias': ''})
-        self.d.sentry.wait()
 
     def test_400_image_instance_create(self):
         """Create an image/instance, verify they exist, and delete them."""
@@ -858,17 +922,6 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
         u.delete_resource(self.nova_demo.servers, instance.id,
                           msg="nova instance")
 
-    def test_500_security_checklist_action(self):
-        """Verify expected result on a default install"""
-        u.log.debug("Testing security-checklist")
-        sentry_unit = self.nova_cc_sentry
-
-        action_id = u.run_action(sentry_unit, "security-checklist")
-        u.wait_on_action(action_id)
-        data = amulet.actions.get_action_output(action_id, full_output=True)
-        assert data.get(u"status") == "failed", \
-            "Security check is expected to not pass by default"
-
     def test_900_restart_on_config_change(self):
         """Verify that the specified services are restarted when the config
            is changed."""
@@ -899,17 +952,13 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
         if cmp_os_release >= 'newton':
             del services['nova-cert']
 
-        if cmp_os_release >= 'rocky':
-            del services['nova-api-os-compute']
-            services['apache2'] = conf_file
-
         if self._get_openstack_release() >= self.xenial_ocata:
             # nova-placement-api is run under apache2 with mod_wsgi
             services['apache2'] = conf_file
 
         # Expected default and alternate values
-        flags_default = 'cpu-allocation-ratio=16.0,ram-allocation-ratio=0.98'
-        flags_alt = 'cpu-allocation-ratio=32.0,ram-allocation-ratio=3.0'
+        flags_default = 'quota_cores=20,quota_instances=40,quota_ram=102400'
+        flags_alt = 'quota_cores=10,quota_instances=20,quota_ram=51200'
         set_default = {'config-flags': flags_default}
         set_alternate = {'config-flags': flags_alt}
 
@@ -942,64 +991,3 @@ class NovaCCBasicDeployment(OpenStackAmuletDeployment):
         action_id = u.run_action(self.nova_cc_sentry, "resume")
         assert u.wait_on_action(action_id), "Resume action failed"
         self._assert_services(should_run=True)
-
-    def test_902_default_quota_settings(self):
-        """Test default quota settings."""
-        config_file = '/etc/nova/nova.conf'
-        quotas = {
-            'quota-instances': 20,
-            'quota-cores': 40,
-            'quota-ram': 102400,
-            'quota-metadata-items': 256,
-            'quota-injected-files': 10,
-            'quota-injected-file-size': 20480,
-            'quota-injected-path-size': 512,
-            'quota-key-pairs': 200,
-            'quota-server-groups': 20,
-            'quota-server-group-members': 20,
-        }
-        cmp_os_release = CompareOpenStackReleases(
-            self._get_openstack_release_string()
-        )
-        if cmp_os_release > 'newton':
-            section = 'quota'
-        else:
-            section = 'DEFAULT'
-        u.log.debug('Changing quotas in charm config')
-        self.d.configure('nova-cloud-controller', quotas)
-        self._auto_wait_for_status(exclude_services=self.exclude_services)
-        self.d.sentry.wait()
-
-        if not u.validate_config_data(self.nova_cc_sentry, config_file,
-                                      section, quotas):
-            amulet.raise_status(amulet.FAIL, msg='update failed')
-
-        u.log.debug('New default quotas found in correct section in nova.conf')
-        u.log.debug('test_902_default_quota_settings PASSED - (OK)')
-
-        # Amulet test framework currently does not support setting charm-config
-        # values to None when an integer is expected by the configuration.
-        # By default, the quota settings are not written to nova.conf unless
-        # explicitly set. In order to keep tests idempotent, the following juju
-        # CLI commands are run to reset the quota values to None.
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-instances")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-cores")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-ram")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-metadata-items")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-injected-files")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-injected-file-size")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-injected-path-size")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-key-pairs")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-server-groups")
-        os.system("juju config nova-cloud-controller --reset"
-                  " quota-server-group-members")
-        self._auto_wait_for_status(exclude_services=self.exclude_services)

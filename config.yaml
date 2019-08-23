@@ -143,42 +143,12 @@ options:
         * shared-db
         * amqp
         * identity-service
-  cache-known-hosts:
-    type: boolean
-    default: false
-    description: |
-      EXPERIMENTAL - If true then the charm will cache host and ip lookups for
-      a unit when populating the knownhosts file for nova-compute service.
-      This is a known performance issue around maintaining the knownhosts files
-      for each nova-compute service, and caching is a strategy to reduce the
-      hook execution time when the 'cloud-compute' relation changes.  If false,
-      then no caching is performed.  Changing from true to false will NOT cause
-      new lookups to be performed.
-      .
-      To clear the caches and force new lookups to be performed, the action
-      'clear-unit-knownhost-cache' should be used.
-      .
-      This config flag is experimental as it's very hard to determine if there
-      will be any DNS issues during the deployment onto different platforms.
-      Thus it may be preferred to keep the flag false during deployment and
-      then switch to true after deployment.
-      .
-      Note that the charm keeps a record of the lookups for each unit
-      regardless of the setting of this flag.  The cache is only used if the
-      flag is true.
-      .
-      At a future release the default will be true.
   console-access-protocol:
     type: string
     default:
     description: |
       Protocol to use when accessing virtual machine console. Supported types
       are None, spice, xvpvnc, novnc and vnc (for both xvpvnc and novnc).
-  console-access-port:
-    type: int
-    default:
-    description: |
-      Used to customize the console access port.
   console-proxy-ip:
     type: string
     default: local
@@ -195,10 +165,6 @@ options:
     type: string
     default:
     description: |
-      DEPRECATED: Please use ssl_cert configuration option or the vault
-      certificates relation.  This configuration option will be removed
-      in the 19.07 charm release.
-      .
       Used for encrypted console connections. This differs from the SSL
       certificate used for API endpoints and is used for console sessions only.
       Setting this value along with console-ssl-key will enable encrypted
@@ -208,12 +174,7 @@ options:
   console-ssl-key:
     type: string
     default:
-    description: |
-      DEPRECATED: Please use ssl_key configuration option or the vault
-      certificates relation.  This configuration option will be removed
-      in the 19.07 charm release.
-      .
-      SSL key to use with certificate specified as console-ssl-cert.
+    description: SSL key to use with certificate specified as console-ssl-cert.
   enable-serial-console:
     type: boolean
     default: false
@@ -221,22 +182,6 @@ options:
       Enable serial console access to instances using websockets (insecure).
       This is only supported on OpenStack Juno or later, and will disable the
       normal console-log output for an instance.
-  enable-new-services:
-    type: boolean
-    default: True
-    description: |
-       Enable new nova-compute services on this host automatically.
-       When a new nova-compute service starts up, it gets registered in the
-       database as an enabled service. Sometimes it can be useful to register
-       new compute services in disabled state and then enabled them at a later
-       point in time. This option only sets this behavior for nova-compute
-       services, it does not auto-disable other services like nova-conductor,
-       nova-scheduler, nova-consoleauth, or nova-osapi_compute.
-       Possible values: True: Each new compute service is enabled as soon as
-       it registers itself. False: Compute services must be enabled via an
-       os-services REST API call or with the CLI with
-       nova service-enable <hostname> <binary>, otherwise they are not ready
-       to use.
   worker-multiplier:
     type: float
     default:
@@ -256,16 +201,12 @@ options:
       at the expense of instance performance.
   ram-allocation-ratio:
     type: float
-    default: 0.98
+    default: 1.5
     description: |
       The physical ram -> virtual ram ratio to use in the Nova scheduler.
       .
       Increasing this value will increase instance density on compute nodes
       at the potential expense of instance performance.
-      .
-      NOTE: When in a hyper-converged architecture, make sure to make enough
-      room for infrastructure services running on your compute hosts by
-      adjusting this value.
   disk-allocation-ratio:
     type: float
     default: 1.0
@@ -274,6 +215,17 @@ options:
       .
       Increasing this value will increase instance density on compute nodes
       with an increased risk of hypervisor storage becoming full.
+  single-nova-consoleauth:
+    type: boolean
+    default: true
+    description: |
+      When this configuration is set to True, a single instance of
+      nova-consoleauth service will be running, this allows users to always
+      authenticate against the same instance and avoid authentications issues
+      when the token used was stored in a different instance.
+      .
+      If memcached is being used to store the tokens, then it's recommended to
+      change this configuration to False.
   action-managed-upgrade:
     type: boolean
     default: False
@@ -286,10 +238,10 @@ options:
       all units on config change.
   scheduler-default-filters:
     type: string
-    default:
+    default: "RetryFilter,AvailabilityZoneFilter,CoreFilter,RamFilter,ComputeFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter"
     description: |
       List of filter class names to use for filtering hosts when not specified in
-      the request.  The default filters varies based on OpenStack release.
+      the request.
   pci-alias:
     type: string
     default:
@@ -479,109 +431,21 @@ options:
     description: |
       A comma-separated list of nagios servicegroups. If left empty, the
       nagios_context will be used as the servicegroup.
-  vendor-data:
+  aci-repo:
+    type: string
+    default: 
+    description: "Apt repository for ACI module, example deb http://a.b.c.d"
+  aci-repo-key:
     type: string
     default:
+    description: "Repo key, if missing no package authentication will be performed"
+  enable-sriov-nic-selection:
+    type: boolean
+    default: False
     description: |
-      A JSON-formatted string that will serve as vendor metadata
-      (via "StaticJSON" provider) to all VM's within an OpenStack deployment,
-      regardless of project or domain. For deployments prior to Rocky and if
-      metadata is configured to be provided by neutron-gateway, this
-      value should be set in the neutron-gateway charm.
-  vendor-data-url:
-    type: string
-    default:
-    description: |
-      A URL serving JSON-formatted data that will serve as vendor metadata
-      (via "DynamicJSON" provider) to all VM's within an OpenStack deployment,
-      regardless of project or domain.
-      .
-      Only supported in OpenStack Newton and higher. For deployments prior to
-      Rocky and if metadata is configured to be provided by neutron-gateway,
-      this value should be set in the neutron-gateway charm.
-  quota-instances:
-    type: int
-    default:
-    description: |
-      The number of instances allowed per project.
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-cores:
-    type: int
-    default:
-    description: |
-      The number of instance cores or vCPUs allowed per project.
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-ram:
-    type: int
-    default:
-    description: |
-      The number of megabytes of instance RAM allowed per project.
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-metadata-items:
-    type: int
-    default:
-    description: |
-      The number of metadata items allowed per instance.
-      .
-      Users can associate metadata with an instance during instance creation.
-      This metadata takes the form of key-value pairs.
-      .
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-injected-files:
-    type: int
-    default:
-    description: |
-      The number of injected files allowed.
-      .
-      File injection allows users to customize the personality of an instance
-      by injecting data into it upon boot.
-      Only text file injection is permitted: binary or ZIP files are not accepted.
-      During file injection, any existing files that match specified files are
-      renamed to include .bak extension appended with a timestamp.
-      .
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-injected-file-size:
-    type: int
-    default:
-    description: |
-      The number of bytes allowed per injected file.
-      .
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-injected-path-size:
-    type: int
-    default:
-    description: |
-      The maximum allowed injected file path length.
-      .
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-key-pairs:
-    type: int
-    default:
-    description: |
-      The maximum number of key pairs allowed per user.
-      .
-      Users can create at least one key pair for each project and use the key
-      pair for multiple instances that belong to that project.
-      .
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-server-groups:
-    type: int
-    default:
-    description: |
-      The maxiumum number of server groups per project. Not supported in Icehouse
-      and before
-      .
-      Server groups are used to control the affinity and anti-affinity
-      scheduling policy for a group of servers or instances. Reducing the
-      quota will not affect any existing group, but new servers will not be
-      allowed into groups that have become over quota.
-      .
-      Possible Values are positive integers or 0 and -1 to disable the quota.
-  quota-server-group-members:
-    type: int
-    default:
-    description: |
-      The maximum number of servers per server group. Not supported in Icehouse
-      and before
-      .
-      Possible Values are positive integers or 0 and -1 to disable the quota.
+      When compute hosts are configured with SRIOV NICs, setting
+      this parameter to True allows users to select which SRIOV NIC
+      is used for an instance. Selection of SRIOV NICs is done using  the
+      pci_passthrough_whitelist map configured on compute hosts,
+      along with the binding:profile physical_network attribute when
+      creating the port for the NIC in neutron.

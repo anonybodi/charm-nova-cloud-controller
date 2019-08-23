@@ -12,18 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from mock import patch
-from unit_tests.test_utils import CharmTestCase
+import os
 
-import actions.openstack_upgrade as openstack_upgrade
+from mock import patch, MagicMock
 
+os.environ['JUJU_UNIT_NAME'] = 'nova-cloud-controller'
+with patch('charmhelpers.core.hookenv.config') as config:
+    with patch('charmhelpers.contrib.openstack.utils.get_os_codename_package'):
+        config.return_value = 'nova'
+        import nova_cc_utils as utils  # noqa
+
+_reg = utils.register_configs
+_map = utils.restart_map
+
+utils.register_configs = MagicMock()
+utils.restart_map = MagicMock()
+
+with patch('nova_cc_utils.guard_map') as gmap:
+    with patch('charmhelpers.core.hookenv.config') as config:
+        config.return_value = False
+        gmap.return_value = {}
+        import openstack_upgrade
+
+utils.register_configs = _reg
+utils.restart_map = _map
+
+from test_utils import CharmTestCase
 
 TO_PATCH = [
-    'charmhelpers.core.hookenv.relation_ids',
-    'hooks.nova_cc_hooks.config_changed',
-    'hooks.nova_cc_hooks.db_joined',
-    'hooks.nova_cc_hooks.neutron_api_relation_joined',
-    'hooks.nova_cc_utils.do_openstack_upgrade',
+    'do_openstack_upgrade',
+    'relation_ids',
+    'neutron_api_relation_joined',
+    'db_joined',
+    'config_changed',
 ]
 
 

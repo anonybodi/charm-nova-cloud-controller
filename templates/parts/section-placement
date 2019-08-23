@@ -16,4 +16,3 @@ password = {{ admin_password }}
 {% if region -%}
 os_region_name = {{ region }}
 {% endif -%}
-randomize_allocation_candidates = true
