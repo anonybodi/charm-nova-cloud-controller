@@ -18,8 +18,7 @@ tags:
 series:
   - xenial
   - bionic
-  - eoan
-  - disco
+  - artful
   - trusty
 extra-bindings:
   public:
@@ -31,8 +30,6 @@ provides:
     scope: container
   cloud-controller:
     interface: nova
-  nova-cell-api:
-    interface: nova-cell
 requires:
   shared-db:
     interface: mysql-shared
@@ -50,6 +47,8 @@ requires:
     interface: quantum
   neutron-api:
     interface: neutron-api
+  cell:
+    interface: nova-cell
   ha:
     interface: hacluster
     scope: container
@@ -60,10 +59,6 @@ requires:
     interface: memcache
   certificates:
     interface: tls-certificates
-  shared-db-cell:
-    interface: mysql-shared
-  amqp-cell:
-    interface: rabbitmq
 peers:
   cluster:
     interface: nova-ha

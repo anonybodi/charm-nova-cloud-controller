@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python
 #
 # Copyright 2016 Canonical Ltd
 #
@@ -16,43 +16,141 @@
 
 import os
 import shutil
-import subprocess
 import sys
-from urllib.parse import urlparse
 import uuid
 
+from subprocess import (
+    check_call,
+)
 
-_path = os.path.dirname(os.path.realpath(__file__))
-_root = os.path.abspath(os.path.join(_path, '..'))
+from urlparse import urlparse
 
+from charmhelpers.core.hookenv import (
+    Hooks,
+    UnregisteredHookError,
+    config,
+    charm_dir,
+    is_leader,
+    is_relation_made,
+    log,
+    local_unit,
+    DEBUG,
+    WARNING,
+    relation_get,
+    relation_ids,
+    relation_set,
+    related_units,
+    open_port,
+    unit_get,
+    status_set,
+)
 
-def _add_path(path):
-    if path not in sys.path:
-        sys.path.insert(1, path)
+from charmhelpers.core.host import (
+    service_pause,
+    service_reload,
+    service_resume,
+)
 
+from charmhelpers.fetch import (
+    apt_install,
+    add_source,
+    apt_update,
+    filter_installed_packages
+)
 
-_add_path(_root)
+from charmhelpers.contrib.openstack.utils import (
+    config_value_changed,
+    configure_installation_source,
+    openstack_upgrade_available,
+    os_release,
+    sync_db_with_multi_ipv6_addresses,
+    pausable_restart_on_change as restart_on_change,
+    is_unit_paused_set,
+    CompareOpenStackReleases,
+)
 
+from charmhelpers.contrib.openstack.neutron import (
+    network_manager,
+)
 
-import charmhelpers.contrib.charmsupport.nrpe as nrpe
-import charmhelpers.contrib.hahelpers.cluster as ch_cluster
-import charmhelpers.contrib.hardening.harden as ch_harden
-import charmhelpers.contrib.network.ip as ch_network_ip
-import charmhelpers.contrib.openstack.cert_utils as cert_utils
-import charmhelpers.contrib.openstack.context as ch_context
-import charmhelpers.contrib.openstack.ha.utils as ch_ha_utils
-import charmhelpers.contrib.openstack.ip as ch_ip
-import charmhelpers.contrib.openstack.neutron as ch_neutron
-import charmhelpers.contrib.openstack.utils as ch_utils
-import charmhelpers.contrib.peerstorage as ch_peerstorage
-import charmhelpers.core.hookenv as hookenv
-import charmhelpers.core.host as ch_host
-import charmhelpers.fetch as ch_fetch
-import charmhelpers.payload.execd as execd
+from nova_cc_context import (
+    NeutronAPIContext,
+    NovaCellContext,
+)
 
-import hooks.nova_cc_common as common
-import hooks.nova_cc_context as nova_cc_context
-import hooks.nova_cc_utils as ncc_utils
+from charmhelpers.contrib.peerstorage import (
+    peer_retrieve,
+    peer_echo,
+)
+
+from nova_cc_utils import (
+    add_hosts_to_cell,
+    auth_token_config,
+    determine_endpoints,
+    determine_packages,
+    determine_ports,
+    disable_package_apache_site,
+    do_openstack_upgrade,
+    is_api_ready,
+    is_cellv2_init_ready,
+    keystone_ca_cert_b64,
+    migrate_nova_databases,
+    placement_api_enabled,
+    save_script_rc,
+    services,
+    ssh_compute_add,
+    ssh_compute_remove,
+    ssh_known_hosts_lines,
+    ssh_authorized_keys_lines,
+    register_configs,
+    restart_map,
+    update_cell_database,
+    NOVA_CONF,
+    console_attributes,
+    service_guard,
+    guard_map,
+    setup_ipv6,
+    is_db_initialised,
+    assess_status,
+    update_aws_compat_services,
+    serial_console_settings,
+)
+
+from charmhelpers.contrib.hahelpers.cluster import (
+    get_hacluster_config,
+    https,
+    is_clustered,
+)
+
+from charmhelpers.contrib.openstack.ha.utils import (
+    update_dns_ha_resource_params,
+)
+
+from charmhelpers.payload.execd import execd_preinstall
+
+from charmhelpers.contrib.openstack.ip import (
+    canonical_url,
+    PUBLIC, INTERNAL, ADMIN,
+    resolve_address,
+)
+
+from charmhelpers.contrib.network.ip import (
+    format_ipv6_addr,
+    get_iface_for_address,
+    get_netmask_for_address,
+    is_ipv6,
+    get_relation_ip,
+)
+
+from charmhelpers.contrib.openstack.cert_utils import (
+    get_certificate_request,
+    process_certificates,
+)
+
+from charmhelpers.contrib.openstack.context import ADDRESS_TYPES
+
+from charmhelpers.contrib.charmsupport import nrpe
+from charmhelpers.contrib.hardening.harden import harden
 
 try:
     FileNotFoundError
@@ -60,66 +158,48 @@ except NameError:
     # python3 compatibility
     FileNotFoundError = OSError
 
-hooks = hookenv.Hooks()
-# Note that CONFIGS is now set up via resolve_CONFIGS so that it is not a
-# module load time constraint.
-CONFIGS = None
+hooks = Hooks()
+CONFIGS = register_configs()
+COLO_CONSOLEAUTH = 'inf: res_nova_consoleauth grp_nova_vips'
+AGENT_CONSOLEAUTH = 'ocf:openstack:nova-consoleauth'
+AGENT_CA_PARAMS = 'op monitor interval="5s"'
 
 
-def deferred_config(k):
-    """Returns a callable that will return the config.  To be used with
-    functions that need lazy evaluation because the run at loadtime, but the
-    evaluation should happen at runtime.
-
-    :param k: the config key to lookup
-    :type k: Option[String, None]
-    :returns: the result of config(k)
-    """
-    return lambda: hookenv.config(k)
-
-
-def resolve_CONFIGS():
-    """lazy function to resolve the CONFIGS so that it doesn't have to evaluate
-    at module load time.  Note that it also returns the CONFIGS so that it can
-    be used in other, module loadtime, functions.
-
-    :returns: CONFIGS variable
-    :rtype: `:class:templating.OSConfigRenderer`
-    """
-    global CONFIGS
-    if CONFIGS is None:
-        CONFIGS = ncc_utils.register_configs()
-    return CONFIGS
-
-
-def leader_init_db_if_ready(skip_acl_check=False, db_rid=None, unit=None):
+def leader_init_db_if_ready(skip_acl_check=False, skip_cells_restarts=False,
+                            db_rid=None, unit=None):
     """Initialise db if leader and db not yet intialised.
 
     NOTE: must be called from database context.
     """
-    if not hookenv.is_leader():
-        hookenv.log("Not leader - skipping db init", level=hookenv.DEBUG)
+    if not is_leader():
+        log("Not leader - skipping db init", level=DEBUG)
         return
 
-    if ncc_utils.is_db_initialised():
-        hookenv.log("Database already initialised - skipping db init",
-                    level=hookenv.DEBUG)
+    if is_db_initialised():
+        log("Database already initialised - skipping db init", level=DEBUG)
         return
 
     # Bugs 1353135 & 1187508. Dbs can appear to be ready before the units
     # acl entry has been added. So, if the db supports passing a list of
     # permitted units then check if we're in the list.
-    allowed_units = hookenv.relation_get('nova_allowed_units',
-                                         rid=db_rid, unit=unit)
-    if skip_acl_check or (allowed_units and hookenv.local_unit() in
+    allowed_units = relation_get('nova_allowed_units', rid=db_rid, unit=unit)
+    if skip_acl_check or (allowed_units and local_unit() in
                           allowed_units.split()):
-        hookenv.status_set('maintenance', 'Running nova db migration')
-        ncc_utils.migrate_nova_databases()
-        hookenv.log('Triggering remote restarts.')
-        update_nova_relation(remote_restart=True)
+        status_set('maintenance', 'Running nova db migration')
+        migrate_nova_databases()
+        log('Triggering remote cloud-compute restarts.')
+        [compute_joined(rid=rid, remote_restart=True)
+            for rid in relation_ids('cloud-compute')]
+        log('Triggering remote neutron-network-service restarts.')
+        [quantum_joined(rid=rid, remote_restart=True)
+            for rid in relation_ids('quantum-network-service')]
+        if not skip_cells_restarts:
+            log('Triggering remote cell restarts.')
+            [nova_cell_relation_joined(rid=rid, remote_restart=True)
+             for rid in relation_ids('cell')]
     else:
-        hookenv.log('allowed_units either not presented, or local unit '
-                    'not in acl list: %s' % repr(allowed_units))
+        log('allowed_units either not presented, or local unit '
+            'not in acl list: %s' % repr(allowed_units))
 
 
 def leader_init_db_if_ready_allowed_units():
@@ -131,32 +211,30 @@ def leader_init_db_if_ready_allowed_units():
     """
     rels = ['shared-db']
     for rname in rels:
-        for rid in hookenv.relation_ids(rname):
-            for unit in hookenv.related_units(rid):
+        for rid in relation_ids(rname):
+            for unit in related_units(rid):
                 leader_init_db_if_ready(db_rid=rid, unit=unit)
 
 
 def update_cell_db_if_ready(skip_acl_check=False, db_rid=None, unit=None):
     """Update the cells db if leader and db's are already intialised"""
-    if not hookenv.is_leader():
+    if not is_leader():
         return
 
-    if not ncc_utils.is_db_initialised():
-        hookenv.log("Database not initialised - skipping cell db update",
-                    level=hookenv.DEBUG)
+    if not is_db_initialised():
+        log("Database not initialised - skipping cell db update", level=DEBUG)
         return
 
-    if not ncc_utils.is_cellv2_init_ready():
+    if not is_cellv2_init_ready():
         return
 
-    allowed_units = hookenv.relation_get('nova_allowed_units',
-                                         rid=db_rid, unit=unit)
-    if skip_acl_check or (allowed_units and hookenv.local_unit() in
+    allowed_units = relation_get('nova_allowed_units', rid=db_rid, unit=unit)
+    if skip_acl_check or (allowed_units and local_unit() in
                           allowed_units.split()):
-        ncc_utils.update_cell_database()
+        update_cell_database()
     else:
-        hookenv.log('allowed_units either not presented, or local unit '
-                    'not in acl list: %s' % repr(allowed_units))
+        log('allowed_units either not presented, or local unit '
+            'not in acl list: %s' % repr(allowed_units))
 
 
 def update_cell_db_if_ready_allowed_units():
@@ -168,225 +246,209 @@ def update_cell_db_if_ready_allowed_units():
     """
     rels = ['shared-db']
     for rname in rels:
-        for rid in hookenv.relation_ids(rname):
-            for unit in hookenv.related_units(rid):
+        for rid in relation_ids(rname):
+            for unit in related_units(rid):
                 update_cell_db_if_ready(db_rid=rid, unit=unit)
 
 
-def update_child_cell_records():
-    for r_id in hookenv.relation_ids('nova-cell-api'):
-        for unit in hookenv.related_units(relid=r_id):
-            nova_cell_api_relation_changed(rid=r_id, unit=unit)
-
-
 @hooks.hook('install.real')
-@ch_harden.harden()
+@harden()
 def install():
-    hookenv.status_set('maintenance', 'Executing pre-install')
-    execd.execd_preinstall()
-    ch_utils.configure_installation_source(hookenv.config('openstack-origin'))
+    status_set('maintenance', 'Executing pre-install')
+    execd_preinstall()
+    configure_installation_source(config('openstack-origin'))
 
-    hookenv.status_set('maintenance', 'Installing apt packages')
-    ch_fetch.apt_update()
-    ch_fetch.apt_install(ncc_utils.determine_packages(), fatal=True)
+    status_set('maintenance', 'Installing apt packages')
+    apt_update()
+    apt_install(determine_packages(), fatal=True)
 
-    ncc_utils.disable_package_apache_site()
-    ncc_utils.stop_deprecated_services()
+    opt = ['--option=Dpkg::Options::=--force-confdef' ,'--option=Dpkg::Options::=--force-confold']
+    if config('aci-repo'):
+       if config('aci-repo-key'):
+           add_source(config('aci-repo'), key=config('aci-repo-key'))
+       else:
+           add_source(config('aci-repo'))
+           opt.append('--allow-unauthenticated')
+       apt_update()
 
-    _files = os.path.join(hookenv.charm_dir(), 'files')
+    if config('enable-sriov-nic-selection'):
+        apt_install(['python-nova-sriov-nics'], options=opt, fatal=True)
+
+    if placement_api_enabled():
+        disable_package_apache_site()
+
+    _files = os.path.join(charm_dir(), 'files')
     if os.path.isdir(_files):
         for f in os.listdir(_files):
             f = os.path.join(_files, f)
             if os.path.isfile(f):
-                hookenv.log('Installing %s to /usr/bin' % f)
+                log('Installing %s to /usr/bin' % f)
                 shutil.copy2(f, '/usr/bin')
-    for port in ncc_utils.determine_ports():
-        hookenv.open_port(port)
+    [open_port(port) for port in determine_ports()]
     msg = 'Disabling services into db relation joined'
-    hookenv.log(msg)
-    hookenv.status_set('maintenance', msg)
-    if not ch_utils.is_unit_paused_set():
-        for svc in ncc_utils.services():
-            ch_host.service_pause(svc)
+    log(msg)
+    status_set('maintenance', msg)
+    if not is_unit_paused_set():
+        for svc in services():
+            service_pause(svc)
     else:
-        hookenv.log('Unit is in paused state, not issuing stop/pause '
-                    'to all services')
+        log('Unit is in paused state, not issuing stop/pause to all services')
 
 
 @hooks.hook('config-changed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map, stopstart=True)
-@ch_harden.harden()
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map(), stopstart=True)
+@harden()
 def config_changed():
-    # if we are paused, delay doing any config changed hooks.
-    # It is forced on the resume.
-    if ch_utils.is_unit_paused_set():
-        hookenv.log("Unit is pause or upgrading. Skipping config_changed",
-                    hookenv.WARNING)
-        return
-
     # neutron-server runs if < juno. Neutron-server creates mysql tables
     # which will subsequently cause db migrations to fail if >= juno.
     # Disable neutron-server if >= juno
-    if ch_utils.CompareOpenStackReleases(
-            ch_utils.os_release('nova-common')) >= 'juno':
+    if CompareOpenStackReleases(os_release('nova-common')) >= 'juno':
         try:
-            ch_host.service_pause('neutron-server')
+            service_pause('neutron-server')
         except ValueError:
             # neutron-server service not installed, ignore.
             pass
-    if hookenv.config('prefer-ipv6'):
-        hookenv.status_set('maintenance', 'configuring ipv6')
-        ncc_utils.setup_ipv6()
-        ch_utils.sync_db_with_multi_ipv6_addresses(
-            hookenv.config('database'),
-            hookenv.config('database-user'),
-            relation_prefix='nova')
+    if config('prefer-ipv6'):
+        status_set('maintenance', 'configuring ipv6')
+        setup_ipv6()
+        sync_db_with_multi_ipv6_addresses(config('database'),
+                                          config('database-user'),
+                                          relation_prefix='nova')
 
     global CONFIGS
-    if not hookenv.config('action-managed-upgrade'):
-        if ch_utils.openstack_upgrade_available('nova-common'):
-            hookenv.status_set('maintenance', 'Running openstack upgrade')
-            ncc_utils.do_openstack_upgrade(CONFIGS)
-            for rid in hookenv.relation_ids('neutron-api'):
-                neutron_api_relation_joined(rid=rid, remote_restart=True)
+    if not config('action-managed-upgrade'):
+        if openstack_upgrade_available('nova-common'):
+            status_set('maintenance', 'Running openstack upgrade')
+            do_openstack_upgrade(CONFIGS)
+            [neutron_api_relation_joined(rid=rid, remote_restart=True)
+                for rid in relation_ids('neutron-api')]
             # NOTE(jamespage): Force re-fire of shared-db joined hook
             # to ensure that nova_api database is setup if required.
-            for r_id in hookenv.relation_ids('shared-db'):
-                db_joined(relation_id=r_id)
+            [db_joined(relation_id=r_id)
+                for r_id in relation_ids('shared-db')]
 
-    ncc_utils.save_script_rc()
+    save_script_rc()
     configure_https()
     CONFIGS.write_all()
 
     # NOTE(jamespage): deal with any changes to the console and serial
     #                  console configuration options
-    filtered = ch_fetch.filter_installed_packages(
-        ncc_utils.determine_packages())
+    filtered = filter_installed_packages(determine_packages())
     if filtered:
-        ch_fetch.apt_install(filtered, fatal=True)
+        apt_install(filtered, fatal=True)
 
-    for r_id in hookenv.relation_ids('identity-service'):
+    for rid in relation_ids('quantum-network-service'):
+        quantum_joined(rid=rid)
+    for r_id in relation_ids('identity-service'):
         identity_joined(rid=r_id)
-    for rid in hookenv.relation_ids('cluster'):
-        cluster_joined(rid)
-    update_nova_relation()
+    [cluster_joined(rid) for rid in relation_ids('cluster')]
+    [compute_joined(rid=rid) for rid in relation_ids('cloud-compute')]
 
     update_nrpe_config()
 
     # If the region value has changed, notify the cloud-compute relations
     # to ensure the value is propagated to the compute nodes.
-    if ch_utils.config_value_changed('region'):
-        for rid in hookenv.relation_ids('cloud-compute'):
-            set_region_on_relation_from_config(rid)
+    if config_value_changed('region'):
+        for rid in relation_ids('cloud-compute'):
+            for unit in related_units(rid):
+                compute_changed(rid, unit)
 
-    ncc_utils.update_aws_compat_services()
-
-    if hookenv.is_leader() and not ncc_utils.get_shared_metadatasecret():
-        ncc_utils.set_shared_metadatasecret()
-    for rid in hookenv.relation_ids('ha'):
-        ha_joined(rid)
-    if (not ch_utils.is_unit_paused_set() and
-            ncc_utils.is_console_auth_enabled()):
-        ch_host.service_resume('nova-consoleauth')
+    update_nova_consoleauth_config()
+    update_aws_compat_services()
 
 
 @hooks.hook('amqp-relation-joined')
 def amqp_joined(relation_id=None):
-    hookenv.relation_set(relation_id=relation_id,
-                         username=hookenv.config('rabbit-user'),
-                         vhost=hookenv.config('rabbit-vhost'))
+    relation_set(relation_id=relation_id,
+                 username=config('rabbit-user'), vhost=config('rabbit-vhost'))
 
 
 @hooks.hook('amqp-relation-changed')
 @hooks.hook('amqp-relation-departed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def amqp_changed():
     if 'amqp' not in CONFIGS.complete_contexts():
-        hookenv.log('amqp relation incomplete. Peer not ready?')
+        log('amqp relation incomplete. Peer not ready?')
         return
-    CONFIGS.write(ncc_utils.NOVA_CONF)
+    CONFIGS.write(NOVA_CONF)
     leader_init_db_if_ready_allowed_units()
     # db init for cells v2 requires amqp transport_url and db connections
     # to be set in nova.conf, so we attempt db init in here as well as the
     # db relation-changed hooks.
     update_cell_db_if_ready_allowed_units()
+    [nova_cell_relation_joined(rid=rid)
+        for rid in relation_ids('cell')]
 
-    update_child_cell_records()
+    for r_id in relation_ids('nova-api'):
+        nova_api_relation_joined(rid=r_id)
 
     # NOTE: trigger restart on nova-api-metadata on
     #       neutron-gateway units once nova-cc has working
     #       amqp connection (avoiding service down on n-gateway)
-    for rid in hookenv.relation_ids('quantum-network-service'):
+    for rid in relation_ids('quantum-network-service'):
         quantum_joined(rid=rid, remote_restart=True)
 
 
 @hooks.hook('shared-db-relation-joined')
 def db_joined(relation_id=None):
-    cmp_os_release = ch_utils.CompareOpenStackReleases(
-        ch_utils.os_release('nova-common'))
-    if hookenv.config('prefer-ipv6'):
-        ch_utils.sync_db_with_multi_ipv6_addresses(
-            hookenv.config('database'),
-            hookenv.config('database-user'),
-            relation_prefix='nova')
+    cmp_os_release = CompareOpenStackReleases(os_release('nova-common'))
+    if config('prefer-ipv6'):
+        sync_db_with_multi_ipv6_addresses(config('database'),
+                                          config('database-user'),
+                                          relation_prefix='nova')
 
         if cmp_os_release >= 'mitaka':
             # NOTE: mitaka uses a second nova-api database as well
-            ch_utils.sync_db_with_multi_ipv6_addresses(
-                'nova_api',
-                hookenv.config('database-user'),
-                relation_prefix='novaapi')
+            sync_db_with_multi_ipv6_addresses('nova_api',
+                                              config('database-user'),
+                                              relation_prefix='novaapi')
 
         if cmp_os_release >= 'ocata':
             # NOTE: ocata requires cells v2
-            ch_utils.sync_db_with_multi_ipv6_addresses(
-                'nova_cell0',
-                hookenv.config('database-user'),
-                relation_prefix='novacell0')
+            sync_db_with_multi_ipv6_addresses('nova_cell0',
+                                              config('database-user'),
+                                              relation_prefix='novacell0')
     else:
         # Avoid churn check for access-network early
         access_network = None
-        for unit in hookenv.related_units(relid=relation_id):
-            access_network = hookenv.relation_get(rid=relation_id, unit=unit,
-                                                  attribute='access-network')
+        for unit in related_units(relid=relation_id):
+            access_network = relation_get(rid=relation_id, unit=unit,
+                                          attribute='access-network')
             if access_network:
                 break
-        host = ch_network_ip.get_relation_ip('shared-db',
-                                             cidr_network=access_network)
+        host = get_relation_ip('shared-db', cidr_network=access_network)
 
-        hookenv.relation_set(nova_database=hookenv.config('database'),
-                             nova_username=hookenv.config('database-user'),
-                             nova_hostname=host,
-                             relation_id=relation_id)
+        relation_set(nova_database=config('database'),
+                     nova_username=config('database-user'),
+                     nova_hostname=host,
+                     relation_id=relation_id)
 
         if cmp_os_release >= 'mitaka':
             # NOTE: mitaka uses a second nova-api database as well
-            hookenv.relation_set(
-                novaapi_database='nova_api',
-                novaapi_username=hookenv.config('database-user'),
-                novaapi_hostname=host,
-                relation_id=relation_id)
+            relation_set(novaapi_database='nova_api',
+                         novaapi_username=config('database-user'),
+                         novaapi_hostname=host,
+                         relation_id=relation_id)
 
         if cmp_os_release >= 'ocata':
             # NOTE: ocata requires cells v2
-            hookenv.relation_set(
-                novacell0_database='nova_cell0',
-                novacell0_username=hookenv.config('database-user'),
-                novacell0_hostname=host,
-                relation_id=relation_id)
+            relation_set(novacell0_database='nova_cell0',
+                         novacell0_username=config('database-user'),
+                         novacell0_hostname=host,
+                         relation_id=relation_id)
 
 
 @hooks.hook('shared-db-relation-changed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def db_changed():
     if 'shared-db' not in CONFIGS.complete_contexts():
-        hookenv.log('shared-db relation incomplete. Peer not ready?')
+        log('shared-db relation incomplete. Peer not ready?')
         return
 
     CONFIGS.write_all()
@@ -395,90 +457,92 @@ def db_changed():
     # be set in nova.conf, so we attempt db init in here as well as the
     # amqp-relation-changed hook.
     update_cell_db_if_ready()
-    update_child_cell_records()
 
 
 @hooks.hook('image-service-relation-changed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def image_service_changed():
     if 'image-service' not in CONFIGS.complete_contexts():
-        hookenv.log('image-service relation incomplete. Peer not ready?')
+        log('image-service relation incomplete. Peer not ready?')
         return
-    CONFIGS.write(ncc_utils.NOVA_CONF)
+    CONFIGS.write(NOVA_CONF)
     # TODO: special case config flag for essex (strip protocol)
+
+    for r_id in relation_ids('nova-api'):
+        nova_api_relation_joined(rid=r_id)
 
 
 @hooks.hook('identity-service-relation-joined')
 def identity_joined(rid=None):
-    if hookenv.config('vip') and not ch_cluster.is_clustered():
-        hookenv.log('Defering registration until clustered',
-                    level=hookenv.DEBUG)
+    if config('vip') and not is_clustered():
+        log('Defering registration until clustered', level=DEBUG)
         return
-    public_url = ch_ip.canonical_url(CONFIGS, ch_ip.PUBLIC)
-    internal_url = ch_ip.canonical_url(CONFIGS, ch_ip.INTERNAL)
-    admin_url = ch_ip.canonical_url(CONFIGS, ch_ip.ADMIN)
-    hookenv.relation_set(relation_id=rid,
-                         **ncc_utils.determine_endpoints(public_url,
-                                                         internal_url,
-                                                         admin_url))
+
+    public_url = canonical_url(CONFIGS, PUBLIC)
+    internal_url = canonical_url(CONFIGS, INTERNAL)
+    admin_url = canonical_url(CONFIGS, ADMIN)
+    relation_set(
+        relation_id=rid,
+        **determine_endpoints(public_url,
+                              internal_url,
+                              admin_url))
 
 
 @hooks.hook('identity-service-relation-changed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def identity_changed():
     if 'identity-service' not in CONFIGS.complete_contexts():
-        hookenv.log('identity-service relation incomplete. Peer not ready?')
+        log('identity-service relation incomplete. Peer not ready?')
         return
     CONFIGS.write('/etc/nova/api-paste.ini')
-    CONFIGS.write(ncc_utils.NOVA_CONF)
-    update_nova_relation()
-    for rid in hookenv.relation_ids('nova-vmware'):
-        nova_vmware_relation_joined(rid)
-    for rid in hookenv.relation_ids('neutron-api'):
-        neutron_api_relation_joined(rid)
+    CONFIGS.write(NOVA_CONF)
+    [compute_joined(rid) for rid in relation_ids('cloud-compute')]
+    [quantum_joined(rid) for rid in relation_ids('quantum-network-service')]
+    [nova_vmware_relation_joined(rid) for rid in relation_ids('nova-vmware')]
+    [neutron_api_relation_joined(rid) for rid in relation_ids('neutron-api')]
     configure_https()
+
+    for r_id in relation_ids('nova-api'):
+        nova_api_relation_joined(rid=r_id)
 
 
 @hooks.hook('nova-volume-service-relation-joined',
             'cinder-volume-service-relation-joined')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def volume_joined():
-    CONFIGS.write(ncc_utils.NOVA_CONF)
+    CONFIGS.write(NOVA_CONF)
     # kick identity_joined() to publish possibly new nova-volume endpoint.
-    for rid in hookenv.relation_ids('identity-service'):
-        identity_joined(rid)
+    [identity_joined(rid) for rid in relation_ids('identity-service')]
 
 
 def _auth_config():
     '''Grab all KS auth token config from api-paste.ini, or return empty {}'''
-    ks_auth_host = ncc_utils.auth_token_config('auth_host')
+    ks_auth_host = auth_token_config('auth_host')
     if not ks_auth_host:
         # if there is no auth_host set, identity-service changed hooks
         # have not fired, yet.
         return {}
     cfg = {
         'auth_host': ks_auth_host,
-        'auth_port': ncc_utils.auth_token_config('auth_port'),
-        'auth_protocol': ncc_utils.auth_token_config('auth_protocol'),
-        'service_protocol': ncc_utils.auth_token_config('service_protocol'),
-        'service_port': ncc_utils.auth_token_config('service_port'),
-        'service_username': ncc_utils.auth_token_config('admin_user'),
-        'service_password': ncc_utils.auth_token_config('admin_password'),
-        'service_tenant_name': ncc_utils.auth_token_config(
-            'admin_tenant_name'),
-        'auth_uri': ncc_utils.auth_token_config('auth_uri'),
+        'auth_port': auth_token_config('auth_port'),
+        'auth_protocol': auth_token_config('auth_protocol'),
+        'service_protocol': auth_token_config('service_protocol'),
+        'service_port': auth_token_config('service_port'),
+        'service_username': auth_token_config('admin_user'),
+        'service_password': auth_token_config('admin_password'),
+        'service_tenant_name': auth_token_config('admin_tenant_name'),
+        'auth_uri': auth_token_config('auth_uri'),
         # quantum-gateway interface deviates a bit.
         'keystone_host': ks_auth_host,
-        'service_tenant': ncc_utils.auth_token_config('admin_tenant_name'),
+        'service_tenant': auth_token_config('admin_tenant_name'),
         # add api version if found
-        'api_version': ncc_utils.auth_token_config('api_version') or '2.0',
-        'admin_domain_name': ncc_utils.auth_token_config('admin_domain_name')
+        'api_version': auth_token_config('api_version') or '2.0',
     }
     return cfg
 
@@ -495,17 +559,17 @@ def save_novarc():
         out.write('export OS_PASSWORD=%s\n' % auth['service_password'])
         out.write('export OS_TENANT_NAME=%s\n' % auth['service_tenant_name'])
         out.write('export OS_AUTH_URL=%s\n' % ks_url)
-        out.write('export OS_REGION_NAME=%s\n' % hookenv.config('region'))
+        out.write('export OS_REGION_NAME=%s\n' % config('region'))
 
 
 def neutron_settings():
     neutron_settings = {}
-    if hookenv.is_relation_made('neutron-api', 'neutron-plugin'):
-        neutron_api_info = nova_cc_context.NeutronAPIContext()()
+    if is_relation_made('neutron-api', 'neutron-plugin'):
+        neutron_api_info = NeutronAPIContext()()
         neutron_settings.update({
             # XXX: Rename these relations settings?
             'quantum_plugin': neutron_api_info['neutron_plugin'],
-            'region': hookenv.config('region'),
+            'region': config('region'),
             'quantum_security_groups':
             neutron_api_info['neutron_security_groups'],
             'quantum_url': neutron_api_info['neutron_url'],
@@ -520,11 +584,11 @@ def keystone_compute_settings():
     ks_auth_config = _auth_config()
     rel_settings = {}
 
-    if ch_neutron.network_manager() == 'neutron':
+    if network_manager() == 'neutron':
         if ks_auth_config:
             rel_settings.update(ks_auth_config)
         rel_settings.update(neutron_settings())
-    ks_ca = ncc_utils.keystone_ca_cert_b64()
+    ks_ca = keystone_ca_cert_b64()
     if ks_auth_config and ks_ca:
         rel_settings['ca_cert'] = ks_ca
     return rel_settings
@@ -532,387 +596,144 @@ def keystone_compute_settings():
 
 def console_settings():
     rel_settings = {}
-    proto = common.console_attributes('protocol')
+    proto = console_attributes('protocol')
     if not proto:
         return {}
-    rel_settings['console_keymap'] = hookenv.config('console-keymap')
+    rel_settings['console_keymap'] = config('console-keymap')
     rel_settings['console_access_protocol'] = proto
 
     console_ssl = False
-    if (hookenv.config('console-ssl-cert') and
-            hookenv.config('console-ssl-key')):
+    if config('console-ssl-cert') and config('console-ssl-key'):
         console_ssl = True
 
-    if hookenv.config('console-proxy-ip') == 'local':
+    if config('console-proxy-ip') == 'local':
         if console_ssl:
-            address = ch_ip.resolve_address(endpoint_type=ch_ip.PUBLIC)
-            address = ch_network_ip.format_ipv6_addr(address) or address
+            address = resolve_address(endpoint_type=PUBLIC)
+            address = format_ipv6_addr(address) or address
             proxy_base_addr = 'https://%s' % address
         else:
             # canonical_url will only return 'https:' if API SSL are enabled.
-            proxy_base_addr = ch_ip.canonical_url(CONFIGS, ch_ip.PUBLIC)
+            proxy_base_addr = canonical_url(CONFIGS, PUBLIC)
     else:
-        if console_ssl or ch_cluster.https():
+        if console_ssl or https():
             schema = "https"
         else:
             schema = "http"
 
-        proxy_base_addr = ("{}://{}"
-                           .format(schema, hookenv.config('console-proxy-ip')))
+        proxy_base_addr = "%s://%s" % (schema, config('console-proxy-ip'))
 
     if proto == 'vnc':
         protocols = ['novnc', 'xvpvnc']
     else:
         protocols = [proto]
     for _proto in protocols:
-        rel_settings['console_proxy_{}_address'.format(_proto)] = \
-            "{}:{}{}".format(
-                proxy_base_addr,
-                common.console_attributes('proxy-port', proto=_proto),
-                common.console_attributes('proxy-page', proto=_proto))
+        rel_settings['console_proxy_%s_address' % (_proto)] = \
+            "%s:%s%s" % (proxy_base_addr,
+                         console_attributes('proxy-port', proto=_proto),
+                         console_attributes('proxy-page', proto=_proto))
         rel_settings['console_proxy_%s_host' % (_proto)] = \
             urlparse(proxy_base_addr).hostname
         rel_settings['console_proxy_%s_port' % (_proto)] = \
-            common.console_attributes('proxy-port', proto=_proto)
+            console_attributes('proxy-port', proto=_proto)
 
     return rel_settings
 
 
-def get_compute_config(remote_restart=False):
-    """Get the compute config as a dictionary to set on the relation.
-
-    This gets the console settings (from console_settings()) the serial console
-    settings and some additional items that are in the form suitable for a
-    relation_set.
-
-    :param remote_restart: whether a restart should be notified
-    :type remote_restart: bool
-    :returns: dictionary settings for the relation
-    :rtype: Dict[str, ANY]
-    """
+@hooks.hook('cloud-compute-relation-joined')
+def compute_joined(rid=None, remote_restart=False):
+    cons_settings = console_settings()
+    relation_set(relation_id=rid, **cons_settings)
     rel_settings = {
-        'network_manager': ch_neutron.network_manager(),
+        'network_manager': network_manager(),
         'volume_service': 'cinder',
         # (comment from bash vers) XXX Should point to VIP if clustered, or
         # this may not even be needed.
-        'ec2_host': hookenv.unit_get('private-address'),
-        'region': hookenv.config('region'),
+        'ec2_host': unit_get('private-address'),
+        'region': config('region'),
     }
-    rel_settings.update(console_settings())
-    rel_settings.update(ncc_utils.serial_console_settings())
+    rel_settings.update(serial_console_settings())
     # update relation setting if we're attempting to restart remote
     # services
     if remote_restart:
         rel_settings['restart_trigger'] = str(uuid.uuid4())
 
-    return rel_settings
-
-
-def update_nova_relation(remote_restart=False):
-    for rid in hookenv.relation_ids('cloud-compute'):
-        compute_joined(rid=rid, remote_restart=remote_restart)
-    for rid in hookenv.relation_ids('quantum-network-service'):
-        quantum_joined(rid=rid, remote_restart=remote_restart)
-    for rid in hookenv.relation_ids('nova-cell-api'):
-        nova_cell_api_relation_joined(rid=rid, remote_restart=remote_restart)
-
-
-@hooks.hook('cloud-compute-relation-joined')
-def compute_joined(rid=None, remote_restart=False):
-    rel_settings = get_compute_config(remote_restart=remote_restart)
     rel_settings.update(keystone_compute_settings())
-    hookenv.relation_set(relation_id=rid, **rel_settings)
+    relation_set(relation_id=rid, **rel_settings)
 
 
 @hooks.hook('cloud-compute-relation-changed')
-def cloud_compute_relation_changed():
-    """Performs actions associated with when the cloud compute relation changes
-    for a unit.
+def compute_changed(rid=None, unit=None):
+    for r_id in relation_ids('nova-api'):
+        nova_api_relation_joined(rid=r_id)
 
-    * add hosts to the cell when ready
-    * notifies the region to the unit, if it has changed
-    * notifies the ssh known hosts and authorized keys to the unit
-    """
-    add_hosts_to_cell_when_ready()
-    set_region_on_relation_from_config(rid=None)
-    update_ssh_keys_and_notify_compute_units(rid=None, unit=None)
+    rel_settings = relation_get(rid=rid, unit=unit)
+    if not rel_settings.get('region', None) == config('region'):
+        relation_set(relation_id=rid, region=config('region'))
 
+    if is_leader() and is_cellv2_init_ready() and is_db_initialised():
+        add_hosts_to_cell()
 
-def add_hosts_to_cell_when_ready():
-    """Helper function to call add_hosts_to_cell() when the unit is the leader
-    and the cellv2 and database are ready.
-
-    :raises: subprocess.CalledProcessError if cells command fails
-    """
-    if (hookenv.is_leader() and
-            ncc_utils.is_cellv2_init_ready() and
-            ncc_utils.is_db_initialised()):
-        ncc_utils.add_hosts_to_cell()
-
-
-def set_region_on_relation_from_config(rid=None):
-    """Helper function that sets the new region for that relation to trigger a
-    change for any units that see it differently.
-
-    :param rid: The relation to set, or if None, the current one related
-                to the hook.
-    :type rid: Union[str. None]
-    """
-    hookenv.relation_set(relation_id=rid, region=hookenv.config('region'))
-
-
-def update_ssh_keys_and_notify_compute_units(rid=None, unit=None):
-    """Update and notify the collected ssh keys to nova-compute units
-
-    Update/add and notify, for the associated nova-compute unit, the ssh key to
-    all the other nova-compute units.
-
-    If rid=None and unit=None, then this function is being called in the
-    context of a cloud-compute relation changed hook, and will relate to that
-    unit.  If rid and unit are set, then this function is being called to
-    refresh and update all specific units.
-
-    :param rid: The relation to check/set, or if None, the current one related
-                to the hook.
-    :type rid: Union[str. None]
-    :param unit: the unit to check, of None for the current one according to
-                  the hook.
-    :type unit: Union[str, None]
-    """
-    update_ssh_key(rid=rid, unit=unit)
-
-    # if we have goal state, then only notify the ssh authorized_keys and
-    # known_hosts onto the relation when the last compute unit has arrived
-    # (i.e. we've reached the goal state)
-    if _goal_state_achieved_for_relid('cloud-compute', rid):
-        notify_ssh_keys_to_compute_units(rid=rid, unit=unit)
-
-
-def _goal_state_achieved_for_relid(reltype, rid=None):
-    """Check that the goal-state has been achieved for the reltype and relid.
-
-    If goal state is not available, then the function returns True.
-    Otherwise, as goal state (from Juju) replies with all the units for the
-    relation type, without respect for the relation id.  i.e. normally, Juju is
-    a hierarchy of relation type -> relation id -> units, but goal state is
-    relation type -> units (where all the units across the relation ids are
-    grouped.
-
-    If the relid is None, then the relation_id for the hook is used (by the
-    library function related_units()).
-
-    Note this function checks a particular relation id for reaching goal state,
-    not all relation ids.  To do that (with this function) do:
-
-        all(_goal_state_achieved_for_relid(reltype, rid)
-            for rid in relation_ids(reltype))
-
-    :param reltype: the relation type (e.g. 'cloud-compute')
-    :type reltype: str
-    :param rid: the relation id, or None for the default
-    :type rid: Union[str, None]
-    :returns: True if goal state is achieved, or not available
-    :rtype: bool
-    """
-    try:
-        # There should always be one unit -- if not, this block KeyErrors and
-        # so the goal is false.
-        units_so_far = hookenv.related_units(relid=rid)
-        # goal state returns all the units by the relation type (in this
-        # case 'cloud-compute').  So we need to only check the ones with
-        # the same prefix e.g. nova-compute/0, nova-compute/1 vs
-        # nova-compute-b/0, etc if there were two separate relations to two
-        # nova-compute applications
-        all_units = list(
-            hookenv.expected_related_units(reltype=reltype))
-        prefix = units_so_far[0].split('/')[0]
-        target_units = [u for u in all_units if u.split('/')[0] == prefix]
-        return units_so_far == target_units
-    except (KeyError, IndexError):
-        # expected_related_units() can raise a KeyError in the case there are
-        # no units  - in that case assume that the goal wasn't met
-        # if there are no units_so_far, then Index error is raised
-        return False
-    except NotImplementedError:
-        # Not implemented means that goal state is not available
-        pass
-    return True
-
-
-def update_ssh_key(rid=None, unit=None):
-    """Update ssh keys for a nova-compute unit connected on the cloud-compute
-    relation.
-
-    If rid=None and unit=None, then this function is being called in the
-    context of a cloud-compute relation changed hook, and will relate to that
-    unit.  If rid and unit are set, then this function is being called to
-    refresh/update all specified units.
-
-    If the 'migration_auth_type' isn't 'ssh' or the 'nova_ssh_public_key' in
-    the relation data from the connected nova-compute unit isn't available,
-    then this function does nothing.  Note that the compute unit sets keys for
-    the charm (root user) and the nova service (nova user), and these are
-    supplied separately.  Note that the nova ssh public is processed (if
-    available) even if the migration auth type is not 'ssh'.
-
-    :param rid: The relation to check/set, or if None, the current one related
-                to the hook.
-    :type rid: Union[str, None]
-    :param unit: the unit to check, of None for the current one according to
-                 the hook.
-    :type unit: Union[str, None]
-    """
-    rel_settings = hookenv.relation_get(rid=rid, unit=unit)
-
-    migration_auth_type = rel_settings.get('migration_auth_type', None)
-
-    # bail out of doing ANY ssh keys for the remote unit if not
-    # migration_auth_type is set in that units relation_data
-    if migration_auth_type is None:
+    if 'migration_auth_type' not in rel_settings:
         return
-
-    remote_service = ncc_utils.remote_service_from_unit(unit)
-    private_address = rel_settings.get('private-address', None)
-    hostname = rel_settings.get('hostname', '')
-
-    # only resolve the hosts once, so this is the memo for it
-    resolved_hosts = None
-
-    if migration_auth_type == 'ssh':
-        # TODO(ajkavanagh) -- the hookenv was previous behaviour, but there
-        # isn't a good place to put this yet; it will be moved or removed at
-        # the end of the patch series.
-        # hookenv.status_set('maintenance', 'configuring live migration')
+    if rel_settings['migration_auth_type'] == 'ssh':
+        status_set('maintenance', 'configuring live migration')
         key = rel_settings.get('ssh_public_key')
         if not key:
-            hookenv.log('SSH migration set but peer did not publish key.'
-                        ' relation={}, unit={}'
-                        .format(rid or hookenv.relation_id(),
-                                unit or hookenv.remote_unit()))
+            log('SSH migration set but peer did not publish key.')
             return
-        resolved_hosts = ncc_utils.resolve_hosts_for(private_address, hostname)
-        ncc_utils.ssh_compute_add_known_hosts(
-            remote_service, resolved_hosts, user=None)
-        ncc_utils.add_authorized_key_if_doesnt_exist(
-            key, remote_service, private_address, user=None)
-
-    nova_ssh_public_key = rel_settings.get('nova_ssh_public_key', None)
-
-    # Always try to fetch the user 'nova' key on the remote compute unit
-    if nova_ssh_public_key:
-        # in the unlikely event the migration type wasn't ssh, we still have to
-        # resolve the hosts
-        if resolved_hosts is None:
-            resolved_hosts = ncc_utils.resolve_hosts_for(private_address,
-                                                         hostname)
-        ncc_utils.ssh_compute_add_known_hosts(
-            remote_service, resolved_hosts, user='nova')
-        ncc_utils.add_authorized_key_if_doesnt_exist(
-            nova_ssh_public_key, remote_service, private_address, user='nova')
-
-
-def notify_ssh_keys_to_compute_units(rid=None, unit=None):
-    """Update and notify the collected ssh keys to nova-compute units
-
-    Update/add and notify, for the associated nova-compute unit, the ssh key to
-    all the other nova-compute units.
-
-    If rid=None and unit=None, then this function is being called in the
-    context of a cloud-compute relation changed hook, and will relate to that
-    unit.  If rid and unit are set, then this function is being called to
-    refresh and update all specific units.
-
-    :param rid: The relation to check/set, or if None, the current one related
-                to the hook.
-    :type rid: Union[str. None]
-    :param unit: the unit to check, of None for the current one according to
-                  the hook.
-    :type unit: Union[str, None]
-    """
-    rel_settings = hookenv.relation_get(rid=rid, unit=unit)
-
-    migration_auth_type = rel_settings.get('migration_auth_type', None)
-    if migration_auth_type is None:
+        ssh_compute_add(key, rid=rid, unit=unit)
+        index = 0
+        for line in ssh_known_hosts_lines(unit=unit):
+            relation_set(
+                relation_id=rid,
+                relation_settings={
+                    'known_hosts_{}'.format(index): line})
+            index += 1
+        relation_set(relation_id=rid, known_hosts_max_index=index)
+        index = 0
+        for line in ssh_authorized_keys_lines(unit=unit):
+            relation_set(
+                relation_id=rid,
+                relation_settings={
+                    'authorized_keys_{}'.format(index): line})
+            index += 1
+        relation_set(relation_id=rid, authorized_keys_max_index=index)
+    if 'nova_ssh_public_key' not in rel_settings:
         return
-
-    remote_service = ncc_utils.remote_service_from_unit(unit)
-
-    if migration_auth_type == 'ssh':
-        _set_hosts_and_keys_on_relation(remote_service, rid, user=None)
-
-    if rel_settings.get('nova_ssh_public_key', None):
-        _set_hosts_and_keys_on_relation(remote_service, rid, user='nova')
-
-
-def _set_hosts_and_keys_on_relation(remote_service, rid=None, user=None):
-    """Set the known hosts and authorized keys on the relation specified.
-
-    Takes the authorized_keys and known hosts collected from all of the related
-    compute units (that have been processed) and sets them on the relation via
-    the _batch_write_ssh_on_relation() helper.
-
-    :param remote_service: the remote service related the keys/hosts
-    :type remote_service: str
-    :param rid: The relation to check/set, or if None, the current one related
-                to the hook.
-    :type rid: Union[str. None]
-    :type unit: Union[str, None]
-    :param user: the user to use in the format strings, or None for default
-    :type user: Union[str, None]
-    """
-    if user is not None:
-        known_hosts_prefix = "{}_known_hosts".format(user)
-        known_hosts_max_key = "{}_known_hosts_max_index".format(user)
-        authorized_prefix = "{}_authorized_keys".format(user)
-        authorized_keys_max_key = "{}_authorized_keys_max_index".format(user)
-    else:
-        known_hosts_prefix = "known_hosts"
-        known_hosts_max_key = "known_hosts_max_index"
-        authorized_prefix = "authorized_keys"
-        authorized_keys_max_key = "authorized_keys_max_index"
-
-    _batch_write_ssh_on_relation(
-        rid, known_hosts_prefix, known_hosts_max_key,
-        ncc_utils.ssh_known_hosts_lines(remote_service, user=user))
-
-    _batch_write_ssh_on_relation(
-        rid, authorized_prefix, authorized_keys_max_key,
-        ncc_utils.ssh_authorized_keys_lines(remote_service, user=user))
-
-
-def _batch_write_ssh_on_relation(rid, prefix, max_index, _iter):
-    """Helper to set the relation data from an iterable to specified relation
-    (which may be None to indicate the current, default, relation).  The prefix
-    param is used to construct the key a "{prefix}_{index}" with index
-    incrementing from 0 for each line delivered from the iterable.
-
-    :param rid: The relation to check/set, or if None, the current one related
-                to the hook.
-    :type rid: Union[str, None]
-    :param prefix: The prefix for writing the related index line (e.g.
-                   known_hosts)
-    :type prefix: str
-    :param max_index_key: the key against which to set the maximum index that
-                          was written (i.e. number of keys set).
-    :param _iter: an iterable that returns the lines to associate with keys
-    :type _iter: Iterable[str]
-    """
-    index = 0
-    for line in _iter:
-        hookenv.relation_set(
+    if rel_settings['nova_ssh_public_key']:
+        ssh_compute_add(rel_settings['nova_ssh_public_key'],
+                        rid=rid, unit=unit, user='nova')
+        index = 0
+        for line in ssh_known_hosts_lines(unit=unit, user='nova'):
+            relation_set(
+                relation_id=rid,
+                relation_settings={
+                    '{}_known_hosts_{}'.format(
+                        'nova',
+                        index): line})
+            index += 1
+        relation_set(
             relation_id=rid,
-            relation_settings={"{}_{}".format(prefix, index): line})
-        index += 1
-    hookenv.relation_set(relation_id=rid,
-                         relation_settings={"{}".format(max_index): index})
+            relation_settings={
+                '{}_known_hosts_max_index'.format('nova'): index})
+        index = 0
+        for line in ssh_authorized_keys_lines(unit=unit, user='nova'):
+            relation_set(
+                relation_id=rid,
+                relation_settings={
+                    '{}_authorized_keys_{}'.format(
+                        'nova',
+                        index): line})
+            index += 1
+        relation_set(
+            relation_id=rid,
+            relation_settings={
+                '{}_authorized_keys_max_index'.format('nova'): index})
 
 
 @hooks.hook('cloud-compute-relation-departed')
 def compute_departed():
-    relation_data = hookenv.relation_get()
-    ncc_utils.ssh_compute_remove(
-        public_key=relation_data.get('ssh_public_key'))
-    ncc_utils.clear_hostset_cache_for(relation_data.get('private-address'))
+    ssh_compute_remove(public_key=relation_get('ssh_public_key'))
 
 
 @hooks.hook('neutron-network-service-relation-joined',
@@ -925,7 +746,7 @@ def quantum_joined(rid=None, remote_restart=False):
     rel_settings.update(ks_auth_config)
 
     # must pass the keystone CA cert, if it exists.
-    ks_ca = ncc_utils.keystone_ca_cert_b64()
+    ks_ca = keystone_ca_cert_b64()
     if ks_auth_config and ks_ca:
         rel_settings['ca_cert'] = ks_ca
 
@@ -934,103 +755,161 @@ def quantum_joined(rid=None, remote_restart=False):
     if remote_restart:
         rel_settings['restart_trigger'] = str(uuid.uuid4())
 
-    rel_settings.update(ncc_utils.get_metadata_settings(CONFIGS))
-    hookenv.relation_set(relation_id=rid, **rel_settings)
+    relation_set(relation_id=rid, **rel_settings)
 
 
 @hooks.hook('cluster-relation-joined')
 def cluster_joined(relation_id=None):
     settings = {}
 
-    for addr_type in ch_context.ADDRESS_TYPES:
-        address = ch_network_ip.get_relation_ip(
+    for addr_type in ADDRESS_TYPES:
+        address = get_relation_ip(
             addr_type,
-            cidr_network=hookenv.config('os-{}-network'.format(addr_type)))
+            cidr_network=config('os-{}-network'.format(addr_type)))
         if address:
             settings['{}-address'.format(addr_type)] = address
 
-    settings['private-address'] = ch_network_ip.get_relation_ip('cluster')
+    settings['private-address'] = get_relation_ip('cluster')
 
-    hookenv.relation_set(relation_id=relation_id, relation_settings=settings)
+    relation_set(relation_id=relation_id, relation_settings=settings)
 
 
 @hooks.hook('cluster-relation-changed',
             'cluster-relation-departed',
             'leader-settings-changed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map, stopstart=True)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map(), stopstart=True)
 def cluster_changed():
     CONFIGS.write_all()
-    if hookenv.relation_ids('cluster'):
-        ch_peerstorage.peer_echo(includes=['dbsync_state'])
-        dbsync_state = ch_peerstorage.peer_retrieve('dbsync_state')
+    if relation_ids('cluster'):
+        peer_echo(includes=['dbsync_state'])
+        dbsync_state = peer_retrieve('dbsync_state')
         if dbsync_state == 'complete':
-            if not ch_utils.is_unit_paused_set():
-                for svc in ncc_utils.services():
-                    ch_host.service_resume(svc)
+            if not is_unit_paused_set():
+                for svc in services():
+                    service_resume(svc)
             else:
-                hookenv.log('Unit is in paused state, not issuing '
-                            'start/resume to all services')
+                log('Unit is in paused state, not issuing start/resume to all '
+                    'services')
         else:
-            if not ch_utils.is_unit_paused_set():
-                hookenv.log('Database sync not ready. Shutting down services')
-                for svc in ncc_utils.services():
-                    ch_host.service_pause(svc)
+            if not is_unit_paused_set():
+                log('Database sync not ready. Shutting down services')
+                for svc in services():
+                    service_pause(svc)
             else:
-                hookenv.log(
-                    'Database sync not ready. Would shut down services but '
+                log('Database sync not ready. Would shut down services but '
                     'unit is in paused state, not issuing stop/pause to all '
                     'services')
-    # The shared metadata secret is stored in the leader-db and if its changed
-    # the gateway needs to know.
-    for rid in hookenv.relation_ids('quantum-network-service'):
-        quantum_joined(rid=rid, remote_restart=False)
 
 
 @hooks.hook('ha-relation-joined')
 def ha_joined(relation_id=None):
-    ha_console_settings = {}
-    ha_console_settings['delete_resources'] = [
-        'vip_consoleauth',
-        'res_nova_consoleauth'
-    ]
-    settings = ch_ha_utils.generate_ha_relation_data(
-        'nova',
-        extra_settings=ha_console_settings)
+    cluster_config = get_hacluster_config()
+    resources = {
+        'res_nova_haproxy': 'lsb:haproxy',
+    }
+    resource_params = {
+        'res_nova_haproxy': 'op monitor interval="5s"',
+    }
+    init_services = {
+        'res_nova_haproxy': 'haproxy'
+    }
+    clones = {
+        'cl_nova_haproxy': 'res_nova_haproxy'
+    }
+    colocations = {}
 
-    hookenv.relation_set(relation_id=relation_id, **settings)
+    if config('dns-ha'):
+        update_dns_ha_resource_params(relation_id=relation_id,
+                                      resources=resources,
+                                      resource_params=resource_params)
+    else:
+        vip_group = []
+        for vip in cluster_config['vip'].split():
+            if is_ipv6(vip):
+                res_nova_vip = 'ocf:heartbeat:IPv6addr'
+                vip_params = 'ipv6addr'
+            else:
+                res_nova_vip = 'ocf:heartbeat:IPaddr2'
+                vip_params = 'ip'
+
+            iface = (get_iface_for_address(vip) or
+                     config('vip_iface'))
+            netmask = (get_netmask_for_address(vip) or
+                       config('vip_cidr'))
+
+            if iface is not None:
+                vip_key = 'res_nova_{}_vip'.format(iface)
+                if vip_key in vip_group:
+                    if vip not in resource_params[vip_key]:
+                        vip_key = '{}_{}'.format(vip_key, vip_params)
+                    else:
+                        log("Resource '%s' (vip='%s') already exists in "
+                            "vip group - skipping" % (vip_key, vip), WARNING)
+                        continue
+
+                resources[vip_key] = res_nova_vip
+                resource_params[vip_key] = (
+                    'params {ip}="{vip}" cidr_netmask="{netmask}"'
+                    ' nic="{iface}"'.format(ip=vip_params,
+                                            vip=vip,
+                                            iface=iface,
+                                            netmask=netmask)
+                )
+                vip_group.append(vip_key)
+
+            if len(vip_group) >= 1:
+                relation_set(groups={'grp_nova_vips': ' '.join(vip_group)})
+
+        if (config('single-nova-consoleauth') and
+                console_attributes('protocol')):
+            colocations['vip_consoleauth'] = COLO_CONSOLEAUTH
+            init_services['res_nova_consoleauth'] = 'nova-consoleauth'
+            resources['res_nova_consoleauth'] = AGENT_CONSOLEAUTH
+            resource_params['res_nova_consoleauth'] = AGENT_CA_PARAMS
+
+    relation_set(relation_id=relation_id,
+                 init_services=init_services,
+                 corosync_bindiface=cluster_config['ha-bindiface'],
+                 corosync_mcastport=cluster_config['ha-mcastport'],
+                 resources=resources,
+                 resource_params=resource_params,
+                 clones=clones,
+                 colocations=colocations)
 
 
 @hooks.hook('ha-relation-changed')
 def ha_changed():
-    clustered = hookenv.relation_get('clustered')
+    clustered = relation_get('clustered')
     if not clustered or clustered in [None, 'None', '']:
-        hookenv.log('ha_changed: hacluster subordinate not fully clustered.')
+        log('ha_changed: hacluster subordinate not fully clustered.')
         return
 
-    CONFIGS.write(ncc_utils.NOVA_CONF)
+    CONFIGS.write(NOVA_CONF)
 
-    hookenv.log('Cluster configured, notifying other services and updating '
-                'keystone endpoint configuration')
-    for rid in hookenv.relation_ids('identity-service'):
+    log('Cluster configured, notifying other services and updating '
+        'keystone endpoint configuration')
+    for rid in relation_ids('identity-service'):
         identity_joined(rid=rid)
+
+    update_nova_consoleauth_config()
 
 
 @hooks.hook('shared-db-relation-broken')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
 def db_departed():
     CONFIGS.write_all()
     update_cell_db_if_ready(skip_acl_check=True)
-    for r_id in hookenv.relation_ids('cluster'):
-        hookenv.relation_set(relation_id=r_id, dbsync_state='incomplete')
-    if not ch_utils.is_unit_paused_set():
-        for svc in ncc_utils.services():
-            ch_host.service_pause(svc)
+    for r_id in relation_ids('cluster'):
+        relation_set(relation_id=r_id, dbsync_state='incomplete')
+    if not is_unit_paused_set():
+        for svc in services():
+            service_pause(svc)
     else:
-        hookenv.log('Unit is in paused state, not issuing stop/pause to all '
-                    'services')
+        log('Unit is in paused state, not issuing stop/pause to all '
+            'services')
 
 
 @hooks.hook('amqp-relation-broken',
@@ -1039,10 +918,12 @@ def db_departed():
             'image-service-relation-broken',
             'nova-volume-service-relation-broken',
             'quantum-network-service-relation-broken')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
 def relation_broken():
     CONFIGS.write_all()
+    [nova_cell_relation_joined(rid=rid)
+        for rid in relation_ids('cell')]
 
 
 def configure_https():
@@ -1055,119 +936,135 @@ def configure_https():
     CONFIGS.write_all()
     if 'https' in CONFIGS.complete_contexts():
         cmd = ['a2ensite', 'openstack_https_frontend']
-        subprocess.check_call(cmd)
+        check_call(cmd)
     else:
         cmd = ['a2dissite', 'openstack_https_frontend']
-        subprocess.check_call(cmd)
+        check_call(cmd)
 
     # TODO: improve this by checking if local CN certs are available
     # first then checking reload status (see LP #1433114).
-    if not ch_utils.is_unit_paused_set():
-        ch_host.service_reload('apache2', restart_on_failure=True)
+    if not is_unit_paused_set():
+        service_reload('apache2', restart_on_failure=True)
 
-    for rid in hookenv.relation_ids('identity-service'):
+    for rid in relation_ids('identity-service'):
         identity_joined(rid=rid)
 
 
 @hooks.hook()
 def nova_vmware_relation_joined(rid=None):
-    rel_settings = {'network_manager': ch_neutron.network_manager()}
+    rel_settings = {'network_manager': network_manager()}
 
     ks_auth = _auth_config()
     if ks_auth:
         rel_settings.update(ks_auth)
         rel_settings.update(neutron_settings())
 
-    hookenv.relation_set(relation_id=rid, **rel_settings)
+    relation_set(relation_id=rid, **rel_settings)
 
 
 @hooks.hook('nova-vmware-relation-changed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def nova_vmware_relation_changed():
     CONFIGS.write('/etc/nova/nova.conf')
 
 
 @hooks.hook('upgrade-charm')
-@ch_harden.harden()
+@harden()
 def upgrade_charm():
-    ch_fetch.apt_install(
-        ch_fetch.filter_installed_packages(
-            ncc_utils.determine_packages()), fatal=True)
-    packages_removed = ncc_utils.remove_old_packages()
-    if packages_removed:
-        hookenv.log("Package purge detected, restarting services", "INFO")
-        for s in ncc_utils.services():
-            ch_host.service_restart(s)
-
-    # For users already using bionic-rocky which are upgrading their
-    # charm only we need ensure to not end-up with the old
-    # 'wsgi-openstack-api' and the new 'wsgi-placement-api' apache
-    # configurations installed at the same time.
-    ncc_utils.stop_deprecated_services()
-    ncc_utils.disable_package_apache_site(service_reload=True)
-
-    for r_id in hookenv.relation_ids('amqp'):
+    apt_install(filter_installed_packages(determine_packages()),
+                fatal=True)
+    for r_id in relation_ids('amqp'):
         amqp_joined(relation_id=r_id)
-    for r_id in hookenv.relation_ids('identity-service'):
+    for r_id in relation_ids('identity-service'):
         identity_joined(rid=r_id)
-    for r_id in hookenv.relation_ids('cloud-compute'):
-        set_region_on_relation_from_config(r_id)
-        for unit in hookenv.related_units(r_id):
-            update_ssh_keys_and_notify_compute_units(r_id, unit)
-    for r_id in hookenv.relation_ids('shared-db'):
+    for r_id in relation_ids('cloud-compute'):
+        for unit in related_units(r_id):
+            compute_changed(r_id, unit)
+    for r_id in relation_ids('shared-db'):
         db_joined(relation_id=r_id)
-
-    add_hosts_to_cell_when_ready()
 
     leader_init_db_if_ready_allowed_units()
 
     update_nrpe_config()
+    update_nova_consoleauth_config()
+
+
+# remote_restart is defaulted to true as nova-cells may have started the
+# nova-cell process before the db migration was run so it will need a
+# kick
+@hooks.hook('cell-relation-joined')
+def nova_cell_relation_joined(rid=None, remote_restart=True):
+    rel_settings = {
+        'nova_url': "%s:8774/v2" % canonical_url(CONFIGS, INTERNAL)
+    }
+    if remote_restart:
+        rel_settings['restart_trigger'] = str(uuid.uuid4())
+    relation_set(relation_id=rid, **rel_settings)
+
+
+@hooks.hook('cell-relation-changed')
+@restart_on_change(restart_map())
+def nova_cell_relation_changed():
+    CONFIGS.write(NOVA_CONF)
+
+
+def get_cell_type():
+    cell_info = NovaCellContext()()
+    if 'cell_type' in cell_info:
+        return cell_info['cell_type']
+    return None
 
 
 @hooks.hook('neutron-api-relation-joined')
 def neutron_api_relation_joined(rid=None, remote_restart=False):
-    for id_rid in hookenv.relation_ids('identity-service'):
+    for id_rid in relation_ids('identity-service'):
         identity_joined(rid=id_rid)
     rel_settings = {
-        'nova_url': ch_ip.canonical_url(CONFIGS, ch_ip.INTERNAL) + ":8774/v2"
+        'nova_url': canonical_url(CONFIGS, INTERNAL) + ":8774/v2"
     }
+    if get_cell_type():
+        rel_settings['cell_type'] = get_cell_type()
     if remote_restart:
         rel_settings['restart_trigger'] = str(uuid.uuid4())
-    hookenv.relation_set(relation_id=rid, **rel_settings)
+    relation_set(relation_id=rid, **rel_settings)
 
 
 @hooks.hook('neutron-api-relation-changed')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def neutron_api_relation_changed():
-    CONFIGS.write(ncc_utils.NOVA_CONF)
-    update_nova_relation()
+    CONFIGS.write(NOVA_CONF)
+    for rid in relation_ids('cloud-compute'):
+        compute_joined(rid=rid)
+    for rid in relation_ids('quantum-network-service'):
+        quantum_joined(rid=rid)
 
 
 @hooks.hook('neutron-api-relation-broken')
-@ncc_utils.service_guard(ncc_utils.guard_map, resolve_CONFIGS,
-                         active=deferred_config('service-guard'))
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@service_guard(guard_map(), CONFIGS,
+               active=config('service-guard'))
+@restart_on_change(restart_map())
 def neutron_api_relation_broken():
     CONFIGS.write_all()
-    update_nova_relation()
+    for rid in relation_ids('cloud-compute'):
+        compute_joined(rid=rid)
+    for rid in relation_ids('quantum-network-service'):
+        quantum_joined(rid=rid)
 
 
 @hooks.hook('nrpe-external-master-relation-joined',
             'nrpe-external-master-relation-changed')
 def update_nrpe_config():
     # python-dbus is used by check_upstart_job
-    ch_fetch.apt_install('python-dbus')
+    apt_install('python-dbus')
     hostname = nrpe.get_nagios_hostname()
     current_unit = nrpe.get_nagios_unit_name()
     nrpe_setup = nrpe.NRPE(hostname=hostname)
     nrpe.copy_nrpe_checks()
-    nrpe.add_init_service_checks(nrpe_setup,
-                                 ncc_utils.services(),
-                                 current_unit)
+    nrpe.add_init_service_checks(nrpe_setup, services(), current_unit)
     nrpe.add_haproxy_checks(nrpe_setup, current_unit)
     nrpe_setup.write()
 
@@ -1178,11 +1075,9 @@ def memcached_joined():
     spaces address rather than leaving it as the unit address.  This is to
     support network spaces in the memcached charm.
     """
-    hookenv.relation_set(
+    relation_set(
         relation_id=None,
-        relation_settings={
-            'private-address': ch_network_ip.get_relation_ip('memcache')
-        })
+        relation_settings={'private-address': get_relation_ip('memcache')})
     memcached_common()
 
 
@@ -1193,121 +1088,109 @@ def memcached_other_hooks():
     memcached_common()
 
 
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map)
+@restart_on_change(restart_map())
 def memcached_common():
-    CONFIGS.write(ncc_utils.NOVA_CONF)
+    CONFIGS.write(NOVA_CONF)
 
 
 @hooks.hook('zeromq-configuration-relation-changed')
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map, stopstart=True)
+@restart_on_change(restart_map(), stopstart=True)
 def zeromq_configuration_relation_changed():
-    CONFIGS.write(ncc_utils.NOVA_CONF)
+    CONFIGS.write(NOVA_CONF)
+
+
+def update_nova_consoleauth_config():
+    """
+    Configure nova-consoleauth pacemaker resources
+    """
+    relids = relation_ids('ha')
+    if len(relids) == 0:
+        log('Related to {} ha services'.format(len(relids)), level='DEBUG')
+        ha_relid = None
+        data = {}
+    else:
+        ha_relid = relids[0]
+        data = relation_get(rid=ha_relid) or {}
+
+    # initialize keys in case this is a new dict
+    data.setdefault('delete_resources', [])
+    for k in ['colocations', 'init_services', 'resources', 'resource_params']:
+        data.setdefault(k, {})
+
+    if config('single-nova-consoleauth') and console_attributes('protocol'):
+        for item in ['vip_consoleauth', 'res_nova_consoleauth']:
+            try:
+                data['delete_resources'].remove(item)
+            except ValueError:
+                pass  # nothing to remove, we are good
+
+        # the new pcmkr resources have to be added to the existing ones
+        data['colocations']['vip_consoleauth'] = COLO_CONSOLEAUTH
+        data['init_services']['res_nova_consoleauth'] = 'nova-consoleauth'
+        data['resources']['res_nova_consoleauth'] = AGENT_CONSOLEAUTH
+        data['resource_params']['res_nova_consoleauth'] = AGENT_CA_PARAMS
+
+        for rid in relation_ids('ha'):
+            relation_set(rid, **data)
+
+        # nova-consoleauth will be managed by pacemaker, so stop it
+        # and prevent it to be started again at boot. (LP: #1693629).
+        if relation_ids('ha'):
+            service_pause('nova-consoleauth')
+
+    elif (not config('single-nova-consoleauth') and
+          console_attributes('protocol')):
+        for item in ['vip_consoleauth', 'res_nova_consoleauth']:
+            if item not in data['delete_resources']:
+                data['delete_resources'].append(item)
+
+        # remove them from the rel, so they aren't recreated when the hook
+        # is recreated
+        data['colocations'].pop('vip_consoleauth', None)
+        data['init_services'].pop('res_nova_consoleauth', None)
+        data['resources'].pop('res_nova_consoleauth', None)
+        data['resource_params'].pop('res_nova_consoleauth', None)
+
+        for rid in relation_ids('ha'):
+            relation_set(rid, **data)
+
+        service_resume('nova-consoleauth')
+
+
+def nova_api_relation_joined(rid=None):
+    rel_data = {
+        'nova-api-ready': 'yes' if is_api_ready(CONFIGS) else 'no'
+    }
+    relation_set(rid, **rel_data)
 
 
 @hooks.hook('certificates-relation-joined')
 def certs_joined(relation_id=None):
-    hookenv.relation_set(
+    relation_set(
         relation_id=relation_id,
-        relation_settings=cert_utils.get_certificate_request())
+        relation_settings=get_certificate_request())
 
 
 @hooks.hook('certificates-relation-changed')
-@ch_utils.pausable_restart_on_change(ncc_utils.restart_map, stopstart=True)
+@restart_on_change(restart_map(), stopstart=True)
 def certs_changed(relation_id=None, unit=None):
-    cert_utils.process_certificates('nova', relation_id, unit, group='nova')
+    process_certificates('nova', relation_id, unit)
     configure_https()
-    for rid in hookenv.relation_ids('cloud-compute'):
-        compute_joined(rid=rid, remote_restart=False)
-    for rid in hookenv.relation_ids('quantum-network-service'):
-        quantum_joined(rid=rid, remote_restart=False)
-
-
-@hooks.hook('amqp-cell-relation-joined')
-def amqp_cell_joined(relation_id=None):
-    hookenv.relation_set(relation_id=relation_id,
-                         username='nova', vhost='nova')
-
-
-@hooks.hook('shared-db-cell-relation-joined')
-def shared_db_cell_joined(relation_id=None):
-    access_network = None
-    for unit in hookenv.related_units(relid=relation_id):
-        access_network = hookenv.relation_get(rid=relation_id, unit=unit,
-                                              attribute='access-network')
-        if access_network:
-            break
-        host = ch_network_ip.get_relation_ip('shared-db',
-                                             cidr_network=access_network)
-    cell_db = {
-        'nova_database': 'nova',
-        'nova_username': hookenv.config('database-user'),
-        'nova_hostname': host}
-    hookenv.relation_set(relation_id=relation_id, **cell_db)
-
-
-@hooks.hook('nova-cell-api-relation-joined')
-def nova_cell_api_relation_joined(rid=None, remote_restart=False):
-    rel_settings = get_compute_config(remote_restart=remote_restart)
-    if ch_neutron.network_manager() == 'neutron':
-        rel_settings.update(neutron_settings())
-    hookenv.relation_set(relation_id=rid, **rel_settings)
-
-
-@hooks.hook('shared-db-cell-relation-changed')
-def shared_db_cell_changed(relation_id=None):
-    update_child_cell_records()
-
-
-@hooks.hook('amqp-cell-relation-changed')
-def amqp_cell_changed(relation_id=None):
-    update_child_cell_records()
-
-
-@hooks.hook('nova-cell-api-relation-changed')
-def nova_cell_api_relation_changed(rid=None, unit=None):
-    data = hookenv.relation_get(rid=rid, unit=unit)
-    ch_neutron.log("Data: {}".format(data, level=hookenv.DEBUG))
-    if not data.get('cell-name'):
-        return
-    cell_updated = ncc_utils.update_child_cell(
-        name=data['cell-name'],
-        db_service=data['db-service'],
-        amqp_service=data['amqp-service'])
-    if cell_updated:
-        hookenv.log(
-            "Cell registration data changed, triggering a remote restart",
-            level=hookenv.DEBUG)
-        hookenv.relation_set(
-            relation_id=rid,
-            restart_trigger=str(uuid.uuid4()))
 
 
 @hooks.hook('update-status')
-@ch_harden.harden()
+@harden()
 def update_status():
-    hookenv.log('Updating status.')
-
-
-@hooks.hook('pre-series-upgrade')
-def pre_series_upgrade():
-    hookenv.log("Running prepare series upgrade hook", "INFO")
-    ch_utils.series_upgrade_prepare(ncc_utils.pause_unit_helper, CONFIGS)
-
-
-@hooks.hook('post-series-upgrade')
-def post_series_upgrade():
-    hookenv.log("Running complete series upgrade hook", "INFO")
-    ch_utils.series_upgrade_complete(ncc_utils.resume_unit_helper, CONFIGS)
+    log('Updating status.')
 
 
 def main():
     try:
         hooks.execute(sys.argv)
-    except hookenv.UnregisteredHookError as e:
-        hookenv.log('Unknown hook {} - skipping.'.format(e))
-    ncc_utils.assess_status(CONFIGS)
+    except UnregisteredHookError as e:
+        log('Unknown hook {} - skipping.'.format(e))
+    assess_status(CONFIGS)
 
 
 if __name__ == '__main__':
-    resolve_CONFIGS()
     main()

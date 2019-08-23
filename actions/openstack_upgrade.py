@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python
 #
 # Copyright 2016 Canonical Ltd
 #
@@ -14,23 +14,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import sys
 
-_path = os.path.dirname(os.path.realpath(__file__))
-_root = os.path.abspath(os.path.join(_path, '..'))
+sys.path.append('hooks/')
 
+from charmhelpers.contrib.openstack.utils import (
+    do_action_openstack_upgrade,
+)
 
-def _add_path(path):
-    if path not in sys.path:
-        sys.path.insert(1, path)
+from charmhelpers.core.hookenv import (
+    relation_ids,
+)
 
-_add_path(_root)
+from nova_cc_utils import (
+    do_openstack_upgrade,
+)
 
-import charmhelpers.contrib.openstack.utils as ch_utils
-import charmhelpers.core.hookenv as hookenv
-import hooks.nova_cc_utils as utils
-import hooks.nova_cc_hooks as hooks
+from nova_cc_hooks import (
+    config_changed,
+    CONFIGS,
+    neutron_api_relation_joined,
+    db_joined,
+)
 
 
 def openstack_upgrade():
@@ -41,17 +46,16 @@ def openstack_upgrade():
     code to run, otherwise a full service level upgrade will fire
     on config-changed."""
 
-    if (ch_utils.do_action_openstack_upgrade('nova-common',
-                                             utils.do_openstack_upgrade,
-                                             hooks.CONFIGS)):
-        for rid in hookenv.relation_ids('neutron-api'):
-            hooks.neutron_api_relation_joined(rid=rid, remote_restart=True)
+    if (do_action_openstack_upgrade('nova-common',
+                                    do_openstack_upgrade,
+                                    CONFIGS)):
+        [neutron_api_relation_joined(rid=rid, remote_restart=True)
+            for rid in relation_ids('neutron-api')]
         # NOTE(thedac): Force re-fire of shared-db joined hook
         # to ensure that nova_api database is setup if required.
-        for r_id in hookenv.relation_ids('shared-db'):
-            hooks.db_joined(relation_id=r_id)
-        hooks.config_changed()
+        [db_joined(relation_id=r_id)
+            for r_id in relation_ids('shared-db')]
+        config_changed()
 
 if __name__ == '__main__':
-    hooks.resolve_CONFIGS()
     openstack_upgrade()

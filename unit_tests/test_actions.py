@@ -14,7 +14,7 @@
 
 import mock
 
-from unit_tests.test_utils import (
+from test_utils import (
     CharmTestCase,
     get_default_config,
 )
@@ -24,9 +24,29 @@ __default_config = get_default_config()
 # depending on where it's being executed
 __default_config['openstack-origin'] = ''
 
-import hooks.nova_cc_utils as utils  # noqa
-import actions.actions as actions
+with mock.patch('charmhelpers.core.hookenv.config') as config:
+    with mock.patch('charmhelpers.contrib.openstack.utils.get_os_codename_package'):  # noqa
+        # this makes the config behave more similar to the real config()
+        config.side_effect = lambda k: __default_config.get(k)
 
+        import nova_cc_utils as utils  # noqa
+
+# Need to do some early patching to get the module loaded.
+_reg = utils.register_configs
+_map = utils.restart_map
+
+utils.register_configs = mock.MagicMock()
+utils.restart_map = mock.MagicMock()
+
+with mock.patch('nova_cc_utils.guard_map') as gmap:
+    with mock.patch('charmhelpers.core.hookenv.config') as config:
+        config.return_value = False
+        gmap.return_value = {}
+        import actions
+
+# Unpatch it now that its loaded.
+utils.register_configs = _reg
+utils.restart_map = _map
 
 TO_PATCH = [
 ]
@@ -36,11 +56,7 @@ class PauseTestCase(CharmTestCase):
 
     def setUp(self):
         super(PauseTestCase, self).setUp(
-            actions,
-            [
-                "hooks.nova_cc_utils.register_configs",
-                "hooks.nova_cc_utils.pause_unit_helper"
-            ])
+            actions, ["register_configs", "pause_unit_helper"])
         self.register_configs.return_value = 'test-config'
 
     def test_pauses_services(self):
@@ -52,10 +68,7 @@ class ResumeTestCase(CharmTestCase):
 
     def setUp(self):
         super(ResumeTestCase, self).setUp(
-            actions, [
-                "hooks.nova_cc_utils.register_configs",
-                "hooks.nova_cc_utils.resume_unit_helper"
-            ])
+            actions, ["register_configs", "resume_unit_helper"])
         self.register_configs.return_value = 'test-config'
 
     def test_resumes_services(self):
@@ -63,103 +76,11 @@ class ResumeTestCase(CharmTestCase):
         self.resume_unit_helper.assert_called_once_with('test-config')
 
 
-class ClearUnitKnownhostCacheTestCase(CharmTestCase):
-
-    @staticmethod
-    def _relation_get(attribute=None, unit=None, rid=None):
-        return {
-            'aservice/1': '10.0.0.1',
-            'aservice/2': '10.0.0.2',
-            'aservice/3': '10.0.0.3',
-            'aservice/4': '10.0.0.4',
-            'bservice/1': '10.0.1.1',
-            'bservice/2': '10.0.1.2',
-            'bservice/3': '10.0.1.3',
-        }.get(unit)
-
-    def setUp(self):
-        super(ClearUnitKnownhostCacheTestCase, self).setUp(
-            actions, [
-                "charmhelpers.core.hookenv.action_get",
-                "charmhelpers.core.hookenv.action_set",
-                "charmhelpers.core.hookenv.relation_ids",
-                "charmhelpers.core.hookenv.related_units",
-                "charmhelpers.core.hookenv.relation_get",
-                "hooks.nova_cc_utils.clear_hostset_cache_for",
-                "hooks.nova_cc_hooks.update_ssh_key",
-                "hooks.nova_cc_hooks.notify_ssh_keys_to_compute_units",
-            ])
-        self.relation_ids.return_value = ["r:1", "r:2"]
-        self.related_units.side_effect = [
-            ['aservice/1', 'aservice/2', 'aservice/3', 'aservice/4'],
-            ['bservice/1', 'bservice/2', 'bservice/3'],
-        ]
-        self.relation_get.side_effect = \
-            ClearUnitKnownhostCacheTestCase._relation_get
-
-    def test_target_unit(self):
-        self.action_get.return_value = 'aservice/2'
-        actions.clear_unit_knownhost_cache([])
-        self.action_set.assert_called_once_with({
-            "Units updated": [{'aservice/2': '10.0.0.2'}]
-        })
-        self.clear_hostset_cache_for.assert_called_once_with('10.0.0.2')
-        self.update_ssh_key.assert_called_once_with(rid="r:1",
-                                                    unit="aservice/2")
-        self.notify_ssh_keys_to_compute_units.assert_called_once_with(
-            rid="r:1", unit="aservice/4")
-
-    def test_target_service(self):
-        self.action_get.return_value = 'bservice'
-        actions.clear_unit_knownhost_cache([])
-        self.action_set.assert_called_once_with({
-            "Units updated": [
-                {'bservice/1': '10.0.1.1'},
-                {'bservice/2': '10.0.1.2'},
-                {'bservice/3': '10.0.1.3'},
-            ]
-        })
-        self.clear_hostset_cache_for.assert_has_calls(
-            [mock.call('10.0.1.1'),
-             mock.call('10.0.1.2'),
-             mock.call('10.0.1.3')])
-        self.update_ssh_key.assert_has_calls(
-            [mock.call(rid="r:2", unit="bservice/1"),
-             mock.call(rid="r:2", unit="bservice/2"),
-             mock.call(rid="r:2", unit="bservice/3")])
-        self.notify_ssh_keys_to_compute_units.assert_has_calls(
-            [mock.call(rid="r:2", unit="bservice/3")])
-
-    def test_target_all(self):
-        self.action_get.return_value = ''
-        actions.clear_unit_knownhost_cache([])
-        self.action_set.assert_called_once_with({
-            "Units updated": [
-                {'aservice/1': '10.0.0.1'},
-                {'aservice/2': '10.0.0.2'},
-                {'aservice/3': '10.0.0.3'},
-                {'aservice/4': '10.0.0.4'},
-                {'bservice/1': '10.0.1.1'},
-                {'bservice/2': '10.0.1.2'},
-                {'bservice/3': '10.0.1.3'},
-            ]
-        })
-        # check both services were updated; that'll imply the other calls were
-        # made.
-        self.notify_ssh_keys_to_compute_units.assert_has_calls(
-            [mock.call(rid="r:1", unit="aservice/4"),
-             mock.call(rid="r:2", unit="bservice/3")])
-
-
 class MainTestCase(CharmTestCase):
 
     def setUp(self):
-        super(MainTestCase, self).setUp(
-            actions,
-            [
-                "charmhelpers.core.hookenv.action_fail",
-                "hooks.nova_cc_utils.register_configs",
-            ])
+        super(MainTestCase, self).setUp(actions, ["register_configs",
+                                                  "action_fail"])
         self.register_configs.return_value = 'test-config'
 
     def test_invokes_action(self):

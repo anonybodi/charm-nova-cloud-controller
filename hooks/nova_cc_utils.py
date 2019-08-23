@@ -12,36 +12,92 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
-import collections
-import configparser
-import copy
 import os
 import subprocess
-from urllib.parse import urlparse
-import uuid
+import ConfigParser
 
-import charmhelpers.contrib.hahelpers.cluster as ch_cluster
-import charmhelpers.contrib.network.ip as ch_ip
-import charmhelpers.contrib.openstack.context as ch_context
-import charmhelpers.contrib.openstack.ip as ch_openstack_ip
-import charmhelpers.contrib.openstack.templating as ch_templating
-import charmhelpers.contrib.openstack.utils as ch_utils
-import charmhelpers.contrib.peerstorage as ch_peerstorage
-import charmhelpers.core.decorators as ch_decorators
-import charmhelpers.core.hookenv as hookenv
-import charmhelpers.core.host as ch_host
-import charmhelpers.core.unitdata as unitdata
-import charmhelpers.fetch as ch_fetch
+from base64 import b64encode
+from collections import OrderedDict
+from copy import deepcopy
 
-import hooks.nova_cc_common as common
-import hooks.nova_cc_context as nova_cc_context
+from charmhelpers.contrib.openstack import context, templating
+
+from charmhelpers.contrib.hahelpers.cluster import (
+    get_hacluster_config,
+)
+
+from charmhelpers.contrib.peerstorage import (
+    peer_retrieve,
+    peer_store,
+)
+
+from charmhelpers.contrib.openstack.utils import (
+    configure_installation_source,
+    get_host_ip,
+    get_hostname,
+    get_os_codename_install_source,
+    incomplete_relation_data,
+    is_ip,
+    os_release,
+    reset_os_release,
+    save_script_rc as _save_script_rc,
+    is_unit_paused_set,
+    make_assess_status_func,
+    pause_unit,
+    resume_unit,
+    os_application_version_set,
+    token_cache_pkgs,
+    enable_memcache,
+    CompareOpenStackReleases,
+)
+
+from charmhelpers.fetch import (
+    apt_upgrade,
+    apt_update,
+    apt_install,
+    add_source,
+    filter_installed_packages
+)
+
+from charmhelpers.core.hookenv import (
+    config,
+    is_leader,
+    log,
+    relation_get,
+    relation_ids,
+    remote_unit,
+    DEBUG,
+    INFO,
+    ERROR,
+    status_set,
+    related_units,
+    local_unit,
+)
+
+from charmhelpers.core.host import (
+    service_pause,
+    service_resume,
+    service_running,
+    service_start,
+    service_stop,
+    lsb_release,
+    CompareHostReleases,
+)
+
+from charmhelpers.contrib.network.ip import (
+    is_ipv6,
+    ns_query,
+)
+
+from charmhelpers.core.decorators import (
+    retry_on_exception,
+)
+
+import nova_cc_context
 
 TEMPLATES = 'templates/'
 
 CLUSTER_RES = 'grp_nova_vips'
-
-SHARED_METADATA_SECRET_KEY = 'shared-metadata-secret'
 
 # The interface is said to be satisfied if anyone of the interfaces in the
 # list has a complete context.
@@ -50,7 +106,7 @@ REQUIRED_INTERFACES = {
     'messaging': ['amqp'],
     'identity': ['identity-service'],
     'image': ['image-service'],
-    'compute': ['nova-compute', 'nova-cell-api'],
+    'compute': ['nova-compute'],
 }
 
 # removed from original: charm-helper-sh
@@ -62,17 +118,9 @@ BASE_PACKAGES = [
     'python-mysqldb',
     'python-psycopg2',
     'python-psutil',
-    'python-memcache',
+    'python-six',
     'uuid',
-]
-
-PY3_PACKAGES = [
-    'libapache2-mod-wsgi-py3',
-    'python3-nova',
-    'python3-keystoneclient',
-    'python3-psutil',
-    'python3-six',
-    'python3-memcache',
+    'python-memcache',
 ]
 
 VERSION_PACKAGE = 'nova-common'
@@ -93,158 +141,126 @@ SERVICE_BLACKLIST = {
     'newton': ['nova-cert'],
 }
 
-# API_PORTS is now in nova_cc_common.py to break the circular dependency
-# between nova_cc_utils.py and nova_cc_context.py
+API_PORTS = {
+    'nova-api-ec2': 8773,
+    'nova-api-os-compute': 8774,
+    'nova-api-os-volume': 8776,
+    'nova-placement-api': 8778,
+    'nova-objectstore': 3333,
+}
 
 NOVA_CONF_DIR = "/etc/nova"
 NEUTRON_CONF_DIR = "/etc/neutron"
 
 NOVA_CONF = '%s/nova.conf' % NOVA_CONF_DIR
 NOVA_API_PASTE = '%s/api-paste.ini' % NOVA_CONF_DIR
-VENDORDATA_FILE = '%s/vendor_data.json' % NOVA_CONF_DIR
 HAPROXY_CONF = '/etc/haproxy/haproxy.cfg'
 APACHE_CONF = '/etc/apache2/sites-available/openstack_https_frontend'
 APACHE_24_CONF = '/etc/apache2/sites-available/openstack_https_frontend.conf'
-APACHE_SSL_DIR = '/etc/apache2/ssl/nova'
 MEMCACHED_CONF = '/etc/memcached.conf'
 WSGI_NOVA_PLACEMENT_API_CONF = \
-    '/etc/apache2/sites-enabled/wsgi-placement-api.conf'
+    '/etc/apache2/sites-enabled/wsgi-openstack-api.conf'
 PACKAGE_NOVA_PLACEMENT_API_CONF = \
     '/etc/apache2/sites-enabled/nova-placement-api.conf'
-OLD_WSGI_NOVA_PLACEMENT_API_CONF = \
-    '/etc/apache2/sites-enabled/wsgi-openstack-api.conf'
-WSGI_NOVA_METADATA_API_CONF = \
-    '/etc/apache2/sites-enabled/wsgi-openstack-metadata.conf'
-PACKAGE_NOVA_API_OS_COMPUTE_CONF = \
-    '/etc/apache2/sites-available/nova-api-os-compute.conf'
-WSGI_NOVA_API_OS_COMPUTE_CONF = \
-    '/etc/apache2/sites-enabled/wsgi-api-os-compute.conf'
 
 
 def resolve_services():
-    _services = copy.deepcopy(BASE_SERVICES)
-    os_rel = ch_utils.os_release('nova-common')
-    cmp_os_release = ch_utils.CompareOpenStackReleases(os_rel)
+    _services = deepcopy(BASE_SERVICES)
+    os_rel = os_release('nova-common')
     for release in SERVICE_BLACKLIST:
-        if cmp_os_release >= release or hookenv.config('disable-aws-compat'):
-            for service in SERVICE_BLACKLIST[release]:
-                _services.remove(service)
+        if os_rel >= release or config('disable-aws-compat'):
+            [_services.remove(service)
+             for service in SERVICE_BLACKLIST[release]]
     return _services
 
 
-# _BASE_RESOURCE_MAP is a caching global that is set up by
-# get_base_resource_map()
-_BASE_RESOURCE_MAP = None
-
-
-def get_base_resource_map():
-    """Return the base resource map.  Note that it is cached in the
-    _BASE_RESOURCE_MAP global.
-
-    :returns: The base resource map
-    :rtype: collections.OrderedDict
-    """
-    global _BASE_RESOURCE_MAP
-    if _BASE_RESOURCE_MAP is None:
-        _BASE_RESOURCE_MAP = collections.OrderedDict([
-            (NOVA_CONF, {
-                'services': resolve_services(),
-                'contexts': [
-                    ch_context.AMQPContext(ssl_dir=NOVA_CONF_DIR),
-                    ch_context.SharedDBContext(
-                        relation_prefix='nova',
-                        ssl_dir=NOVA_CONF_DIR),
-                    ch_context.OSConfigFlagContext(
-                        charm_flag='nova-alchemy-flags',
-                        template_flag='nova_alchemy_flags'),
-                    ch_context.ImageServiceContext(),
-                    ch_context.OSConfigFlagContext(),
-                    ch_context.SubordinateConfigContext(
-                        interface='nova-vmware',
-                        service='nova',
-                        config_file=NOVA_CONF),
-                    ch_context.SyslogContext(),
-                    ch_context.LogLevelContext(),
-                    nova_cc_context.HAProxyContext(),
-                    nova_cc_context.IdentityServiceContext(
-                        service='nova',
-                        service_user='nova'),
-                    nova_cc_context.VolumeServiceContext(),
-                    ch_context.ZeroMQContext(),
-                    ch_context.NotificationDriverContext(),
-                    nova_cc_context.NovaIPv6Context(),
-                    nova_cc_context.NeutronCCContext(),
-                    nova_cc_context.NovaConfigContext(),
-                    nova_cc_context.RemoteMemcacheContext(),
-                    nova_cc_context.InstanceConsoleContext(),
-                    nova_cc_context.ConsoleSSLContext(),
-                    nova_cc_context.CloudComputeContext(),
-                    ch_context.InternalEndpointContext(),
-                    ch_context.VolumeAPIContext('nova-common'),
-                    nova_cc_context.NeutronAPIContext(),
-                    nova_cc_context.SerialConsoleContext(),
-                    ch_context.MemcacheContext(),
-                    nova_cc_context.NovaMetadataContext('nova-common')],
-            }),
-            (NOVA_API_PASTE, {
-                'services': [s for s in resolve_services() if 'api' in s],
-                'contexts': [nova_cc_context.IdentityServiceContext(),
-                             nova_cc_context.APIRateLimitingContext()],
-            }),
-            (VENDORDATA_FILE, {
-                'services': [],
-                'contexts': [nova_cc_context.NovaMetadataJSONContext(
-                    'nova-common')],
-            }),
-            (HAPROXY_CONF, {
-                'contexts': [
-                    ch_context.HAProxyContext(singlenode_mode=True),
-                    nova_cc_context.HAProxyContext()],
-                'services': ['haproxy'],
-            }),
-            (APACHE_CONF, {
-                'contexts': [nova_cc_context.ApacheSSLContext(
-                    determine_ports)],
-                'services': ['apache2'],
-            }),
-            (APACHE_24_CONF, {
-                'contexts': [nova_cc_context.ApacheSSLContext(
-                    determine_ports)],
-                'services': ['apache2'],
-            }),
-        ])
-    return _BASE_RESOURCE_MAP
-
+BASE_RESOURCE_MAP = OrderedDict([
+    (NOVA_CONF, {
+        'services': resolve_services(),
+        'contexts': [context.AMQPContext(ssl_dir=NOVA_CONF_DIR),
+                     context.SharedDBContext(
+                         relation_prefix='nova', ssl_dir=NOVA_CONF_DIR),
+                     context.OSConfigFlagContext(
+                         charm_flag='nova-alchemy-flags',
+                         template_flag='nova_alchemy_flags'),
+                     context.ImageServiceContext(),
+                     context.OSConfigFlagContext(),
+                     context.SubordinateConfigContext(
+                         interface='nova-vmware',
+                         service='nova',
+                         config_file=NOVA_CONF),
+                     nova_cc_context.NovaCellContext(),
+                     context.SyslogContext(),
+                     context.LogLevelContext(),
+                     nova_cc_context.HAProxyContext(),
+                     nova_cc_context.IdentityServiceContext(
+                         service='nova',
+                         service_user='nova'),
+                     nova_cc_context.VolumeServiceContext(),
+                     context.ZeroMQContext(),
+                     context.NotificationDriverContext(),
+                     nova_cc_context.NovaIPv6Context(),
+                     nova_cc_context.NeutronCCContext(),
+                     nova_cc_context.NovaConfigContext(),
+                     nova_cc_context.InstanceConsoleContext(),
+                     nova_cc_context.ConsoleSSLContext(),
+                     nova_cc_context.CloudComputeContext(),
+                     context.InternalEndpointContext(),
+                     context.VolumeAPIContext('nova-common'),
+                     nova_cc_context.NeutronAPIContext(),
+                     nova_cc_context.SerialConsoleContext(),
+                     context.MemcacheContext()],
+    }),
+    (NOVA_API_PASTE, {
+        'services': [s for s in resolve_services() if 'api' in s],
+        'contexts': [nova_cc_context.IdentityServiceContext(),
+                     nova_cc_context.APIRateLimitingContext()],
+    }),
+    (HAPROXY_CONF, {
+        'contexts': [context.HAProxyContext(singlenode_mode=True),
+                     nova_cc_context.HAProxyContext()],
+        'services': ['haproxy'],
+    }),
+    (APACHE_CONF, {
+        'contexts': [nova_cc_context.ApacheSSLContext()],
+        'services': ['apache2'],
+    }),
+    (APACHE_24_CONF, {
+        'contexts': [nova_cc_context.ApacheSSLContext()],
+        'services': ['apache2'],
+    }),
+])
 
 CA_CERT_PATH = '/usr/local/share/ca-certificates/keystone_juju_ca_cert.crt'
 
 NOVA_SSH_DIR = '/etc/nova/compute_ssh/'
+
+CONSOLE_CONFIG = {
+    'spice': {
+        'packages': ['nova-spiceproxy', 'nova-consoleauth'],
+        'services': ['nova-spiceproxy', 'nova-consoleauth'],
+        'proxy-page': '/spice_auto.html',
+        'proxy-port': 6082,
+    },
+    'novnc': {
+        'packages': ['nova-novncproxy', 'nova-consoleauth'],
+        'services': ['nova-novncproxy', 'nova-consoleauth'],
+        'proxy-page': '/vnc_auto.html',
+        'proxy-port': 6080,
+    },
+    'xvpvnc': {
+        'packages': ['nova-xvpvncproxy', 'nova-consoleauth'],
+        'services': ['nova-xvpvncproxy', 'nova-consoleauth'],
+        'proxy-page': '/console',
+        'proxy-port': 6081,
+    },
+}
 
 SERIAL_CONSOLE = {
     'packages': ['nova-serialproxy', 'nova-consoleauth',
                  'websockify'],
     'services': ['nova-serialproxy', 'nova-consoleauth'],
 }
-
-
-def _replace_service_with_apache2(service, wsgi_script, wsgi_config,
-                                  resource_map, context):
-    for cfile in resource_map:
-        svcs = resource_map[cfile]['services']
-        if service in svcs:
-            svcs.remove(service)
-            if 'apache2' not in svcs:
-                svcs.append('apache2')
-    resource_map[wsgi_config] = {
-        'contexts': [
-            ch_context.WSGIWorkerConfigContext(
-                name=service,
-                script=wsgi_script,
-                user='nova',
-                group='nova'
-            ),
-            context],
-        'services': ['apache2']}
 
 
 def resource_map(actual_services=True):
@@ -256,92 +272,81 @@ def resource_map(actual_services=True):
         unit (ie. apache2) or the services defined in BASE_SERVICES
         (ie.nova-placement-api).
     '''
-    _resource_map = copy.deepcopy(get_base_resource_map())
+    resource_map = deepcopy(BASE_RESOURCE_MAP)
 
     if os.path.exists('/etc/apache2/conf-available'):
-        _resource_map.pop(APACHE_CONF)
+        resource_map.pop(APACHE_CONF)
     else:
-        _resource_map.pop(APACHE_24_CONF)
+        resource_map.pop(APACHE_24_CONF)
 
-    _resource_map[NOVA_CONF]['contexts'].append(
+    resource_map[NOVA_CONF]['contexts'].append(
         nova_cc_context.NeutronCCContext())
 
-    release = ch_utils.os_release('nova-common')
-    cmp_os_release = ch_utils.CompareOpenStackReleases(release)
+    release = os_release('nova-common')
+    cmp_os_release = CompareOpenStackReleases(release)
     if cmp_os_release >= 'mitaka':
-        _resource_map[NOVA_CONF]['contexts'].append(
+        resource_map[NOVA_CONF]['contexts'].append(
             nova_cc_context.NovaAPISharedDBContext(relation_prefix='novaapi',
                                                    database='nova_api',
                                                    ssl_dir=NOVA_CONF_DIR)
         )
 
-    if common.console_attributes('services'):
-        _resource_map[NOVA_CONF]['services'] += (
-            common.console_attributes('services'))
+    if console_attributes('services'):
+        resource_map[NOVA_CONF]['services'] += console_attributes('services')
+        # nova-consoleauth will be managed by pacemaker, if
+        # single-nova-consoleauth is used, then don't monitor for the
+        # nova-consoleauth service to be started (LP: #1660244).
+        if config('single-nova-consoleauth') and relation_ids('ha'):
+            services = resource_map[NOVA_CONF]['services']
+            if 'nova-consoleauth' in services:
+                services.remove('nova-consoleauth')
 
-    if is_serial_console_enabled(cmp_os_release):
-        _resource_map[NOVA_CONF]['services'] += SERIAL_CONSOLE['services']
+    if (config('enable-serial-console') and cmp_os_release >= 'juno'):
+        resource_map[NOVA_CONF]['services'] += SERIAL_CONSOLE['services']
 
     # also manage any configs that are being updated by subordinates.
-    vmware_ctxt = ch_context.SubordinateConfigContext(
-        interface='nova-vmware', service='nova', config_file=NOVA_CONF)
+    vmware_ctxt = context.SubordinateConfigContext(interface='nova-vmware',
+                                                   service='nova',
+                                                   config_file=NOVA_CONF)
     vmware_ctxt = vmware_ctxt()
     if vmware_ctxt and 'services' in vmware_ctxt:
         for s in vmware_ctxt['services']:
-            if s not in _resource_map[NOVA_CONF]['services']:
-                _resource_map[NOVA_CONF]['services'].append(s)
+            if s not in resource_map[NOVA_CONF]['services']:
+                resource_map[NOVA_CONF]['services'].append(s)
 
-    if ch_utils.enable_memcache(release=release):
-        _resource_map[MEMCACHED_CONF] = {
-            'contexts': [ch_context.MemcacheContext()],
+    if enable_memcache(release=release):
+        resource_map[MEMCACHED_CONF] = {
+            'contexts': [context.MemcacheContext()],
             'services': ['memcached']}
 
-    if (actual_services and
-            ch_utils.CompareOpenStackReleases(release) >= 'rocky'):
-        # For Rocky we decided to switch from systemd to use apache2
-        # wsgi mod for the service nova-api-os-compute.
-        _replace_service_with_apache2(
-            'nova-api-os-compute',
-            '/usr/bin/nova-api-wsgi',
-            WSGI_NOVA_API_OS_COMPUTE_CONF,
-            _resource_map,
-            nova_cc_context.ComputeAPIHAProxyContext())
-
     if actual_services and placement_api_enabled():
-        _replace_service_with_apache2(
-            'nova-placement-api',
-            '/usr/bin/nova-placement-api',
-            WSGI_NOVA_PLACEMENT_API_CONF,
-            _resource_map,
-            nova_cc_context.PlacementAPIHAProxyContext())
-    elif not placement_api_enabled():
-        for cfile in _resource_map:
-            svcs = _resource_map[cfile]['services']
+        for cfile in resource_map:
+            svcs = resource_map[cfile]['services']
             if 'nova-placement-api' in svcs:
                 svcs.remove('nova-placement-api')
-    if enable_metadata_api():
-        if actual_services:
-            svcs = ['apache2']
-        else:
-            svcs = ['nova-api-metadata']
-        _resource_map[WSGI_NOVA_METADATA_API_CONF] = {
-            'contexts': [
-                ch_context.WSGIWorkerConfigContext(
-                    name="nova_meta",
-                    user='nova',
-                    group='nova',
-                    script='/usr/bin/nova-metadata-wsgi'),
-                nova_cc_context.MetaDataHAProxyContext(),
-                nova_cc_context.NeutronAPIContext()],
-            'services': svcs}
-    return _resource_map
+                if 'apache2' not in svcs:
+                    svcs.append('apache2')
+        wsgi_script = "/usr/bin/nova-placement-api"
+        resource_map[WSGI_NOVA_PLACEMENT_API_CONF] = {
+            'contexts': [context.WSGIWorkerConfigContext(name="nova",
+                                                         script=wsgi_script),
+                         nova_cc_context.HAProxyContext()],
+            'services': ['apache2']
+        }
+    elif not placement_api_enabled():
+        for cfile in resource_map:
+            svcs = resource_map[cfile]['services']
+            if 'nova-placement-api' in svcs:
+                svcs.remove('nova-placement-api')
+
+    return resource_map
 
 
 def register_configs(release=None):
-    release = release or ch_utils.os_release('nova-common')
-    configs = ch_templating.OSConfigRenderer(
-        templates_dir=TEMPLATES, openstack_release=release)
-    for cfg, rscs in resource_map().items():
+    release = release or os_release('nova-common')
+    configs = templating.OSConfigRenderer(templates_dir=TEMPLATES,
+                                          openstack_release=release)
+    for cfg, rscs in resource_map().iteritems():
         configs.register(cfg, rscs['contexts'])
     return configs
 
@@ -354,15 +359,10 @@ def restart_map(actual_services=True):
         unit (ie. apache2) or the services defined in BASE_SERVICES
         (ie.nova-placement-api).
     '''
-    services = resource_map(actual_services)
-    restart_map = collections.OrderedDict(
+    return OrderedDict(
         [(cfg, v['services'])
-         for cfg, v in services.items()
+         for cfg, v in resource_map(actual_services).iteritems()
          if v['services']])
-    if os.path.isdir(APACHE_SSL_DIR):
-        _restart_svcs = services[NOVA_CONF]['services'] + ['apache2']
-        restart_map['{}/*'.format(APACHE_SSL_DIR)] = _restart_svcs
-    return restart_map
 
 
 def services():
@@ -379,80 +379,57 @@ def determine_ports():
     for services in restart_map(actual_services=False).values():
         for svc in services:
             try:
-                ports.append(common.api_port(svc))
+                ports.append(API_PORTS[svc])
             except KeyError:
                 pass
     return list(set(ports))
 
 
+def api_port(service):
+    return API_PORTS[service]
+
+
+def console_attributes(attr, proto=None):
+    '''Leave proto unset to query attributes of the protocal specified at
+    runtime'''
+    if proto:
+        console_proto = proto
+    else:
+        console_proto = config('console-access-protocol')
+        if console_proto is not None and console_proto.lower() in ('none', ''):
+            console_proto = None
+    if attr == 'protocol':
+        return console_proto
+    # 'vnc' is a virtual type made up of novnc and xvpvnc
+    if console_proto == 'vnc':
+        if attr in ['packages', 'services']:
+            return list(set(CONSOLE_CONFIG['novnc'][attr] +
+                        CONSOLE_CONFIG['xvpvnc'][attr]))
+        else:
+            return None
+    if console_proto in CONSOLE_CONFIG:
+        return CONSOLE_CONFIG[console_proto][attr]
+    return None
+
+
 def determine_packages():
     # currently all packages match service names
-    release = ch_utils.CompareOpenStackReleases(
-        ch_utils.os_release('nova-common'))
-    packages = copy.deepcopy(BASE_PACKAGES)
+    packages = deepcopy(BASE_PACKAGES)
     for v in resource_map(actual_services=False).values():
         packages.extend(v['services'])
-    # The nova-api-metadata service is served via wsgi and the package is
-    # only needed for the standalone service so remove it to avoid port
-    # clashes.
-    try:
-        packages.remove("nova-api-metadata")
-    except ValueError:
-        pass
-    if common.console_attributes('packages'):
-        packages.extend(common.console_attributes('packages'))
-    if is_serial_console_enabled(release):
+    if console_attributes('packages'):
+        packages.extend(console_attributes('packages'))
+    if (config('enable-serial-console') and
+            CompareOpenStackReleases(os_release('nova-common')) >= 'juno'):
         packages.extend(SERIAL_CONSOLE['packages'])
-    packages.extend(
-        ch_utils.token_cache_pkgs(source=hookenv.config('openstack-origin')))
-    if release >= 'rocky':
-        packages = [p for p in packages if not p.startswith('python-')]
-        packages.extend(PY3_PACKAGES)
-        packages.remove('libapache2-mod-wsgi')
-    if release >= 'stein':
-        # NOTE(jamespage):
-        # workaround to deal with lack of functionality to update the db
-        # connection for Cell 0. At stein, the default SQLAlchemy dialect
-        # switched to mysqldb, which requires use of mysql+pymysql:// in
-        # all connection strings, but there is no way to update the
-        # db url for cell0 as stored in the nova_api DB.
-        packages.append('python3-mysqldb')
 
+    packages.extend(token_cache_pkgs(source=config('openstack-origin')))
     return list(set(packages))
-
-
-def determine_purge_packages():
-    '''
-    Determine list of packages that where previously installed which are no
-    longer needed.
-
-    :returns: list of package names
-    '''
-    release = ch_utils.CompareOpenStackReleases(
-        ch_utils.os_release('keystone'))
-    if release >= 'rocky':
-        pkgs = [p for p in BASE_PACKAGES if p.startswith('python-')]
-        pkgs.extend(['python-nova', 'python-memcache', 'libapache2-mod-wsgi'])
-        return pkgs
-    return []
-
-
-def remove_old_packages():
-    '''Purge any packages that need ot be removed.
-
-    :returns: bool Whether packages were removed.
-    '''
-    installed_packages = ch_fetch.filter_missing_packages(
-        determine_purge_packages())
-    if installed_packages:
-        ch_fetch.apt_purge(installed_packages, fatal=True)
-        ch_fetch.apt_autoremove(purge=True, fatal=True)
-    return bool(installed_packages)
 
 
 def save_script_rc():
     env_vars = {
-        'OPENSTACK_PORT_MCASTPORT': hookenv.config('ha-mcastport'),
+        'OPENSTACK_PORT_MCASTPORT': config('ha-mcastport'),
         'OPENSTACK_SERVICE_API_EC2': 'nova-api-ec2',
         'OPENSTACK_SERVICE_API_OS_COMPUTE': 'nova-api-os-compute',
         'OPENSTACK_SERVICE_CERT': 'nova-cert',
@@ -460,9 +437,9 @@ def save_script_rc():
         'OPENSTACK_SERVICE_OBJECTSTORE': 'nova-objectstore',
         'OPENSTACK_SERVICE_SCHEDULER': 'nova-scheduler',
     }
-    if hookenv.relation_ids('nova-volume-service'):
+    if relation_ids('nova-volume-service'):
         env_vars['OPENSTACK_SERVICE_API_OS_VOL'] = 'nova-api-os-volume'
-    ch_utils.save_script_rc(**env_vars)
+    _save_script_rc(**env_vars)
 
 
 def get_step_upgrade_source(new_src):
@@ -483,17 +460,17 @@ def get_step_upgrade_source(new_src):
         'xenial-ocata': ('*', 'cloud:xenial-newton'),  # LP: #1711209
     }
     try:
-        os_codename = ch_utils.get_os_codename_install_source(new_src)
-        ubuntu_series = ch_host.lsb_release()['DISTRIB_CODENAME'].lower()
+        os_codename = get_os_codename_install_source(new_src)
+        ubuntu_series = lsb_release()['DISTRIB_CODENAME'].lower()
         cur_pocket, step_src = sources['%s-%s' % (ubuntu_series, os_codename)]
-        current_src = ch_utils.os_release('nova-common')
-        step_src_codename = ch_utils.get_os_codename_install_source(step_src)
+        current_src = os_release('nova-common')
+        step_src_codename = get_os_codename_install_source(step_src)
         if cur_pocket == '*' and step_src_codename > current_src:
             return step_src
     except KeyError:
         pass
 
-    ch_utils.configure_installation_source(new_src)
+    configure_installation_source(new_src)
 
     # charmhelpers.contrib.openstack.utils.configure_installation_source()
     # configures the repository in juju_deb.list, while
@@ -502,10 +479,10 @@ def get_step_upgrade_source(new_src):
     for fname in ['cloud-archive.list', 'juju_deb.list']:
         fpath = os.path.join('/etc/apt/sources.list.d/', fname)
         if not os.path.isfile(fpath):
-            hookenv.log('Missing %s skipping it' % fpath, level=hookenv.DEBUG)
+            log('Missing %s skipping it' % fpath, level=DEBUG)
             continue
 
-        with open(fpath, 'rt') as f:
+        with open(fpath, 'r') as f:
             for line in f.readlines():
                 for target_src, (cur_pocket, step_src) in sources.items():
                     if target_src != new_src:
@@ -542,39 +519,14 @@ def disable_policy_rcd():
     os.unlink('/usr/sbin/policy-rc.d')
 
 
-def is_serial_console_enabled(cmp_os_release=None):
-    """Determine whether serial console is enabled in this deploy
-
-    :param cmp_os_release: Release comparison object.
-    :type cmp_os_release: charmhelpers.contrib.openstack.utils.
-                          CompareOpenStackReleases
-    :returns: Whether serial console is enabled in this deploy
-    :rtype: bool
-    """
-    if not cmp_os_release:
-        release = ch_utils.os_release('nova-common')
-        cmp_os_release = ch_utils.CompareOpenStackReleases(release)
-    return hookenv.config('enable-serial-console') and cmp_os_release >= 'juno'
-
-
-def is_console_auth_enabled():
-    """Determine whether console auth is enabled in this deploy
-
-    :returns: Whether console auth is enabled in this deploy
-    :rtype: bool
-    """
-    return bool(is_serial_console_enabled() or
-                hookenv.config('console-access-protocol'))
-
-
 def is_db_initialised():
-    if hookenv.relation_ids('cluster'):
-        dbsync_state = ch_peerstorage.peer_retrieve('dbsync_state')
+    if relation_ids('cluster'):
+        dbsync_state = peer_retrieve('dbsync_state')
         if dbsync_state == 'complete':
-            hookenv.log("Database is initialised", level=hookenv.DEBUG)
+            log("Database is initialised", level=DEBUG)
             return True
 
-    hookenv.log("Database is NOT initialised", level=hookenv.DEBUG)
+    log("Database is NOT initialised", level=DEBUG)
     return False
 
 
@@ -584,16 +536,14 @@ def is_cellv2_init_ready():
     Cells v2 init requires transport_url and database connections to be set
     in nova.conf.
     """
-    amqp = ch_context.AMQPContext()
+    amqp = context.AMQPContext()
     shared_db = nova_cc_context.NovaCellV2SharedDBContext()
-    if (ch_utils.CompareOpenStackReleases(
-            ch_utils.os_release('nova-common')) >= 'ocata' and
+    if (CompareOpenStackReleases(os_release('nova-common')) >= 'ocata' and
             amqp() and shared_db()):
         return True
 
-    hookenv.log(
-        "OpenStack release, database, or rabbitmq not ready for Cells V2",
-        level=hookenv.DEBUG)
+    log("OpenStack release, database, or rabbitmq not ready for Cells V2",
+        level=DEBUG)
     return False
 
 
@@ -602,9 +552,8 @@ def _do_openstack_upgrade(new_src):
     # All upgrades to Liberty are forced to step through Kilo. Liberty does
     # not have the migrate_flavor_data option (Bug #1511466) available so it
     # must be done pre-upgrade
-    if (ch_utils.CompareOpenStackReleases(
-            ch_utils.os_release('nova-common')) == 'kilo' and
-            hookenv.is_leader()):
+    if (CompareOpenStackReleases(os_release('nova-common')) == 'kilo' and
+            is_leader()):
         migrate_nova_flavors()
 
     # 'nova-manage db online_data_migrations' needs to be run before moving to
@@ -612,26 +561,22 @@ def _do_openstack_upgrade(new_src):
     # step was not being executed (LP: #1711209).
     online_data_migrations_if_needed()
 
-    new_os_rel = ch_utils.get_os_codename_install_source(new_src)
-    cmp_new_os_rel = ch_utils.CompareOpenStackReleases(new_os_rel)
-    hookenv.log('Performing OpenStack upgrade to %s.' % (new_os_rel))
+    new_os_rel = get_os_codename_install_source(new_src)
+    cmp_new_os_rel = CompareOpenStackReleases(new_os_rel)
+    log('Performing OpenStack upgrade to %s.' % (new_os_rel))
 
-    ch_utils.configure_installation_source(new_src)
+    configure_installation_source(new_src)
     dpkg_opts = [
         '--option', 'Dpkg::Options::=--force-confnew',
         '--option', 'Dpkg::Options::=--force-confdef',
     ]
 
-    ch_fetch.apt_update(fatal=True)
-    ch_fetch.apt_upgrade(options=dpkg_opts, fatal=True, dist=True)
-    ch_utils.reset_os_release()
-    ch_fetch.apt_install(determine_packages(), fatal=True)
-
-    remove_old_packages()
-    disable_package_apache_site()
+    apt_update(fatal=True)
+    apt_upgrade(options=dpkg_opts, fatal=True, dist=True)
+    reset_os_release()
+    apt_install(determine_packages(), fatal=True)
 
     disable_policy_rcd()
-    stop_deprecated_services()
 
     # NOTE(jamespage) upgrade with existing config files as the
     # havana->icehouse migration enables new service_plugins which
@@ -642,27 +587,27 @@ def _do_openstack_upgrade(new_src):
     if cmp_new_os_rel >= 'mitaka' and not database_setup(prefix='novaapi'):
         # NOTE: Defer service restarts and database migrations for now
         #       as nova_api database is not yet created
-        if (hookenv.relation_ids('cluster') and hookenv.is_leader()):
+        if (relation_ids('cluster') and is_leader()):
             # NOTE: reset dbsync state so that migration will complete
             #       when the nova_api database is setup.
-            ch_peerstorage.peer_store('dbsync_state', None)
+            peer_store('dbsync_state', None)
         return configs
 
     if cmp_new_os_rel >= 'ocata' and not database_setup(prefix='novacell0'):
         # NOTE: Defer service restarts and database migrations for now
         #       as nova_cell0 database is not yet created
-        if (hookenv.relation_ids('cluster') and hookenv.is_leader()):
+        if (relation_ids('cluster') and is_leader()):
             # NOTE: reset dbsync state so that migration will complete
             #       when the novacell0 database is setup.
-            ch_peerstorage.peer_store('dbsync_state', None)
+            peer_store('dbsync_state', None)
         return configs
 
-    if hookenv.is_leader():
-        hookenv.status_set('maintenance', 'Running nova db migration')
+    if is_leader():
+        status_set('maintenance', 'Running nova db migration')
         migrate_nova_databases()
 
-    if not ch_utils.is_unit_paused_set():
-        [ch_host.service_start(s) for s in services()]
+    if not is_unit_paused_set():
+        [service_start(s) for s in services()]
 
     return configs
 
@@ -676,16 +621,16 @@ def database_setup(prefix):
     relation name using the provided prefix.
     '''
     key = '{}_allowed_units'.format(prefix)
-    for db_rid in hookenv.relation_ids('shared-db'):
-        for unit in hookenv.related_units(db_rid):
-            allowed_units = hookenv.relation_get(key, rid=db_rid, unit=unit)
-            if allowed_units and hookenv.local_unit() in allowed_units.split():
+    for db_rid in relation_ids('shared-db'):
+        for unit in related_units(db_rid):
+            allowed_units = relation_get(key, rid=db_rid, unit=unit)
+            if allowed_units and local_unit() in allowed_units.split():
                 return True
     return False
 
 
 def do_openstack_upgrade(configs):
-    new_src = hookenv.config('openstack-origin')
+    new_src = config('openstack-origin')
 
     step_src = get_step_upgrade_source(new_src)
     if step_src is not None:
@@ -693,61 +638,55 @@ def do_openstack_upgrade(configs):
     return _do_openstack_upgrade(new_src)
 
 
-@ch_decorators.retry_on_exception(
-    5, base_delay=3, exc_type=subprocess.CalledProcessError)
+@retry_on_exception(5, base_delay=3, exc_type=subprocess.CalledProcessError)
 def migrate_nova_flavors():
     '''Runs nova-manage to migrate flavor data if needed'''
-    hookenv.log('Migrating nova flavour information in database.',
-                level=hookenv.INFO)
+    log('Migrating nova flavour information in database.', level=INFO)
     cmd = ['nova-manage', 'db', 'migrate_flavor_data']
     try:
         subprocess.check_output(cmd)
     except subprocess.CalledProcessError as e:
-        hookenv.log('migrate_flavor_data failed\n{}'.format(e.output),
-                    level=hookenv.ERROR)
+        log('migrate_flavor_data failed\n{}'.format(e.output), level=ERROR)
         raise
 
 
-@ch_decorators.retry_on_exception(
-    5, base_delay=3, exc_type=subprocess.CalledProcessError)
+@retry_on_exception(5, base_delay=3, exc_type=subprocess.CalledProcessError)
 def online_data_migrations_if_needed():
     '''Runs nova-manage to run online data migrations available since Mitaka'''
-    if (hookenv.is_leader() and
-            ch_utils.CompareOpenStackReleases(
-                ch_utils.os_release('nova-common')) >= 'mitaka'):
-        hookenv.log('Running online_data_migrations', level=hookenv.INFO)
+    if (is_leader() and
+            CompareOpenStackReleases(os_release('nova-common')) >= 'mitaka'):
+        log('Running online_data_migrations', level=INFO)
         cmd = ['nova-manage', 'db', 'online_data_migrations']
         try:
             subprocess.check_output(cmd)
         except subprocess.CalledProcessError as e:
-            hookenv.log('online_data_migrations failed\n{}'.format(e.output),
-                        level=hookenv.ERROR)
+            log('online_data_migrations failed\n{}'.format(e.output),
+                level=ERROR)
             raise
 
 
 def migrate_nova_api_database():
     '''Initialize or migrate the nova_api database'''
-    if ch_utils.CompareOpenStackReleases(
-            ch_utils.os_release('nova-common')) >= 'mitaka':
-        hookenv.log('Migrating the nova-api database.', level=hookenv.INFO)
+    if CompareOpenStackReleases(os_release('nova-common')) >= 'mitaka':
+        log('Migrating the nova-api database.', level=INFO)
         cmd = ['nova-manage', 'api_db', 'sync']
         try:
             subprocess.check_output(cmd)
         except subprocess.CalledProcessError as e:
             # NOTE(coreycb): sync of api_db on upgrade from newton->ocata
             # fails but cell init is successful.
-            hookenv.log('Ignoring CalledProcessError during nova-api database '
-                        'migration\n{}'.format(e.output), level=hookenv.INFO)
+            log('Ignoring CalledProcessError during nova-api database '
+                'migration\n{}'.format(e.output), level=INFO)
 
 
 def migrate_nova_database():
     '''Initialize or migrate the nova database'''
-    hookenv.log('Migrating the nova database.', level=hookenv.INFO)
+    log('Migrating the nova database.', level=INFO)
     cmd = ['nova-manage', 'db', 'sync']
     try:
         subprocess.check_output(cmd)
     except subprocess.CalledProcessError as e:
-        hookenv.log('db sync failed\n{}'.format(e.output), level=hookenv.ERROR)
+        log('db sync failed\n{}'.format(e.output), level=ERROR)
         raise
 
 
@@ -757,75 +696,46 @@ def initialize_cell_databases():
     cell0 is stored in the database named 'nova_cell0'.
     cell1 is stored in the database named 'nova'.
     '''
-    hookenv.log('Creating cell0 database records', level=hookenv.INFO)
+    log('Creating cell0 database records', level=INFO)
     cmd = ['nova-manage', 'cell_v2', 'map_cell0']
     try:
         subprocess.check_output(cmd)
     except subprocess.CalledProcessError as e:
-        hookenv.log('map_cell0 failed\n{}'.format(e.output),
-                    level=hookenv.ERROR)
+        log('map_cell0 failed\n{}'.format(e.output), level=ERROR)
         raise
 
-    hookenv.log('Creating cell1 database records', level=hookenv.INFO)
+    log('Creating cell1 database records', level=INFO)
     cmd = ['nova-manage', 'cell_v2', 'create_cell', '--name', 'cell1',
            '--verbose']
     try:
         subprocess.check_output(cmd)
-        hookenv.log('cell1 was successfully created', level=hookenv.INFO)
+        log('cell1 was successfully created', level=INFO)
     except subprocess.CalledProcessError as e:
         if e.returncode == 1:
-            hookenv.log('Cell1 create_cell failed\n{}'.format(e.output),
-                        level=hookenv.ERROR)
+            log('Cell1 create_cell failed\n{}'.format(e.output), level=ERROR)
             raise
         elif e.returncode == 2:
-            hookenv.log(
-                'Cell1 create_cell failure ignored - a cell is already using '
-                'the transport_url/database combination.', level=hookenv.INFO)
+            log('Cell1 create_cell failure ignored - a cell is already using '
+                'the transport_url/database combination.', level=INFO)
 
 
-def get_cell_uuid(cell, fatal=True):
+def get_cell_uuid(cell):
     '''Get cell uuid
     :param cell: string cell name i.e. 'cell1'
     :returns: string cell uuid
     '''
-    hookenv.log("Listing cell, '{}'".format(cell), level=hookenv.INFO)
-    cells = get_cell_details()
-    cell_info = cells.get(cell)
-    if not cell_info:
-        if fatal:
-            raise Exception("Cannot find cell, '{}', in list_cells."
-                            "".format(cell))
-        return None
-    return cell_info['uuid']
-
-
-def get_cell_details():
-    '''Get cell details
-    :returns: string cell uuid
-    '''
-    hookenv.log("Getting details of cells", level=hookenv.INFO)
-    cells = {}
-    cmd = ['sudo', 'nova-manage', 'cell_v2', 'list_cells', '--verbose']
+    log("Listing cell, '{}'".format(cell), level=INFO)
+    cmd = ['sudo', 'nova-manage', 'cell_v2', 'list_cells']
     try:
-        out = subprocess.check_output(cmd).decode('utf-8')
+        out = subprocess.check_output(cmd)
     except subprocess.CalledProcessError as e:
-        hookenv.log('list_cells failed\n{}'.format(e.output),
-                    level=hookenv.ERROR)
+        log('list_cells failed\n{}'.format(e.output), level=ERROR)
         raise
-    for line in out.split('\n'):
-        columns = line.split('|')
-        if len(columns) < 2:
-            continue
-        columns = [c.strip() for c in columns]
-        try:
-            uuid.UUID(columns[2].strip())
-            cells[columns[1]] = {
-                'uuid': columns[2],
-                'amqp': columns[3],
-                'db': columns[4]}
-        except ValueError:
-            pass
-    return cells
+    cell_uuid = out.split(cell, 1)[1].split()[1]
+    if not cell_uuid:
+        raise Exception("Cannot find cell, '{}', in list_cells."
+                        "".format(cell))
+    return cell_uuid
 
 
 def update_cell_database():
@@ -834,22 +744,20 @@ def update_cell_database():
     This should be called whenever a database or rabbitmq-server relation is
     changed to update the transport_url in the nova_api cell_mappings table.
     '''
-    hookenv.log('Updating cell1 properties', level=hookenv.INFO)
+    log('Updating cell1 properties', level=INFO)
     cell1_uuid = get_cell_uuid('cell1')
     cmd = ['nova-manage', 'cell_v2', 'update_cell', '--cell_uuid', cell1_uuid]
     try:
         subprocess.check_output(cmd)
     except subprocess.CalledProcessError as e:
         if e.returncode == 1:
-            hookenv.log('Cell1 update_cell failed\n{}'.format(e.output),
-                        level=hookenv.ERROR)
+            log('Cell1 update_cell failed\n{}'.format(e.output), level=ERROR)
             raise
         elif e.returncode == 2:
-            hookenv.log(
-                'Cell1 update_cell failure ignored - the properties cannot '
-                'be set.', level=hookenv.INFO)
+            log('Cell1 update_cell failure ignored - the properties cannot '
+                'be set.', level=INFO)
     else:
-        hookenv.log('cell1 was successfully updated', level=hookenv.INFO)
+        log('cell1 was successfully updated', level=INFO)
 
 
 def map_instances():
@@ -870,8 +778,8 @@ def map_instances():
     # still need mapping.
     while exit_code == 1:
         msg = 'Mapping instances. Batch number: {}'.format(iteration)
-        hookenv.status_set('maintenance', msg)
-        hookenv.log(msg, level=hookenv.INFO)
+        status_set('maintenance', msg)
+        log(msg, level=INFO)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
         stdout, stderr = process.communicate()
         exit_code = process.wait()
@@ -879,16 +787,16 @@ def map_instances():
             msg = 'Cell1 map_instances failed\nstdout: {}\nstderr: {}'.format(
                 stdout,
                 stderr)
-            hookenv.log(msg, level=hookenv.ERROR)
+            log(msg, level=ERROR)
             raise Exception(msg)
         iteration += 1
     msg = 'Mapping instances complete'
-    hookenv.status_set('maintenance', msg)
-    hookenv.log(msg, level=hookenv.INFO)
+    status_set('maintenance', msg)
+    log(msg, level=INFO)
 
 
 def archive_deleted_rows(max_rows=None):
-    hookenv.log('Archiving deleted rows', level=hookenv.INFO)
+    log('Archiving deleted rows', level=INFO)
     cmd = ['nova-manage', 'db', 'archive_deleted_rows', '--verbose']
     if max_rows:
         cmd.extend(['--max_rows', str(max_rows)])
@@ -899,7 +807,7 @@ def archive_deleted_rows(max_rows=None):
         msg = 'Archiving deleted rows failed\nstdout: {}\nstderr: {}'.format(
             stdout,
             stderr)
-        hookenv.log(msg, level=hookenv.ERROR)
+        log(msg, level=ERROR)
         raise Exception(msg)
     else:
         return stdout
@@ -907,40 +815,36 @@ def archive_deleted_rows(max_rows=None):
 
 def add_hosts_to_cell():
     '''Map compute hosts to cell'''
-    hookenv.log('Cell1 discover_hosts', level=hookenv.INFO)
+    log('Cell1 discover_hosts', level=INFO)
     cell1_uuid = get_cell_uuid('cell1')
     cmd = ['nova-manage', 'cell_v2', 'discover_hosts', '--cell_uuid',
            cell1_uuid, '--verbose']
     try:
         subprocess.check_output(cmd)
     except subprocess.CalledProcessError as e:
-        hookenv.log('Cell1 discover_hosts failed\n{}'.format(e.output),
-                    level=hookenv.ERROR)
+        log('Cell1 discover_hosts failed\n{}'.format(e.output), level=ERROR)
         raise
 
 
 def finalize_migrate_nova_databases():
-    if hookenv.relation_ids('cluster'):
-        hookenv.log('Informing peers that dbsync is complete',
-                    level=hookenv.INFO)
-        ch_peerstorage.peer_store('dbsync_state', 'complete')
-    hookenv.log('Enabling services', level=hookenv.INFO)
-    if not ch_utils.is_unit_paused_set():
+    if relation_ids('cluster'):
+        log('Informing peers that dbsync is complete', level=INFO)
+        peer_store('dbsync_state', 'complete')
+    log('Enabling services', level=INFO)
+    if not is_unit_paused_set():
         for svc in services():
-            ch_host.service_resume(svc)
+            service_resume(svc)
     else:
-        hookenv.log('Unit is in paused state, not issuing start/resume to all '
-                    'services')
+        log('Unit is in paused state, not issuing start/resume to all '
+            'services')
 
 
 # NOTE(jamespage): Retry deals with sync issues during one-shot HA deploys.
 #                  mysql might be restarting or suchlike.
-@ch_decorators.retry_on_exception(
-    5, base_delay=3, exc_type=subprocess.CalledProcessError)
+@retry_on_exception(5, base_delay=3, exc_type=subprocess.CalledProcessError)
 def migrate_nova_databases():
     '''Runs nova-manage to initialize new databases or migrate existing'''
-    release = ch_utils.CompareOpenStackReleases(
-        ch_utils.os_release('nova-common'))
+    release = CompareOpenStackReleases(os_release('nova-common'))
     if release < 'ocata':
         migrate_nova_api_database()
         migrate_nova_database()
@@ -966,11 +870,11 @@ def auth_token_config(setting):
     Returns currently configured value for setting in api-paste.ini's
     authtoken section, or None.
     """
-    _config = configparser.RawConfigParser()
-    _config.read('/etc/nova/api-paste.ini')
+    config = ConfigParser.RawConfigParser()
+    config.read('/etc/nova/api-paste.ini')
     try:
-        value = _config.get('filter:authtoken', setting)
-    except Exception:
+        value = config.get('filter:authtoken', setting)
+    except:
         return None
     if value.startswith('%'):
         return None
@@ -981,120 +885,42 @@ def keystone_ca_cert_b64():
     '''Returns the local Keystone-provided CA cert if it exists, or None.'''
     if not os.path.isfile(CA_CERT_PATH):
         return None
-    with open(CA_CERT_PATH, 'rb') as _in:
-        return base64.b64encode(_in.read()).decode('utf-8')
+    with open(CA_CERT_PATH) as _in:
+        return b64encode(_in.read())
 
 
-def _ssh_directory_for_remote_service(remote_service, user=None):
-    """Return the directory where ssh known hosts and authorized keys are
-    stored for a remote_service and user (both str)
-
-    :param remote_service: the key that represents the remote service; this is
-        usually derived from the first part of the unit name.  See
-        `remote_service_from_unit()`.
-    :type remote_service: str
-    :param user: the user to use, default is None, meaning root (in effect)
-    :type user: Union[str, None]
-    :return: path suitable for joining
-    :rtype: str
-    """
-    if user:
-        remote_service = "{}_{}".format(remote_service, user)
-    _dir = os.path.join(NOVA_SSH_DIR, remote_service)
-    return _dir
-
-
-def _ensure_ssh_dir_and_file_exists(remote_service, file, user=None):
-    """Ensure that the file associated with a remote_service, filename and
-    optional user does exist, and return that file name.
-
-    :param remote_service: The service str ensure that the dir and file exists
-    :type path: str
-    :param file: The filename (either known_hosts or authorized_keys)
-    :type file: str
-    :param user: The optional user to make the directory more unique
-    :type user: Union[str, None]
-    :returns: the full path of the file (guaranteed to exist)
-    :rtype: str
-    """
-    path = _ssh_directory_for_remote_service(remote_service, user)
-    if not os.path.exists(path):
-        os.makedirs(path)
-    _f = os.path.join(path, file)
-    if not os.path.isfile(_f):
-        open(_f, 'w').close()
-    return _f
-
-
-def remote_service_from_unit(unit=None):
-    """Extract a remote service name from the unit passed, or use the current
-    remote unit for the executing hook call.
-
-    :param unit: the unit name, or None for the current remote unit.
-    :type unit: Union[str, None]
-    :returns: the remote service name which should be consistent for all units
-              on the current relation.
-    :rtype: str
-    """
+def ssh_directory_for_unit(unit=None, user=None):
     if unit:
         remote_service = unit.split('/')[0]
     else:
-        remote_service = hookenv.remote_unit().split('/')[0]
-    return remote_service
+        remote_service = remote_unit().split('/')[0]
+    if user:
+        remote_service = "{}_{}".format(remote_service, user)
+    _dir = os.path.join(NOVA_SSH_DIR, remote_service)
+    for d in [NOVA_SSH_DIR, _dir]:
+        if not os.path.isdir(d):
+            os.mkdir(d)
+    for f in ['authorized_keys', 'known_hosts']:
+        f = os.path.join(_dir, f)
+        if not os.path.isfile(f):
+            open(f, 'w').close()
+    return _dir
 
 
-def known_hosts(remote_service=None, user=None):
-    """Return the known_hosts file as a path for a remote_service string and
-    optional user.
-
-    :param remote_service: The remote service strings to return a file for.
-    :type remote_service: str
-    :param user: optional user to return a file for
-    :type user: Union[str, None]
-    :returns: the path for the file, and a guarantee that it exists
-    :rtype: str
-    """
-    return _ensure_ssh_dir_and_file_exists(remote_service, 'known_hosts', user)
+def known_hosts(unit=None, user=None):
+    return os.path.join(ssh_directory_for_unit(unit, user), 'known_hosts')
 
 
-def authorized_keys(remote_service=None, user=None):
-    """Return the authorized_keys file as a path for a remote_service string
-    and optional user.
-
-    :param remote_service: The remote service strings to return a file for.
-    :type remote_service: str
-    :param user: optional user to return a file for
-    :type user: Union[str, None]
-    :returns: the path for the file, and a guarantee that it exists
-    :rtype: str
-    """
-    return _ensure_ssh_dir_and_file_exists(
-        remote_service, 'authorized_keys', user)
+def authorized_keys(unit=None, user=None):
+    return os.path.join(ssh_directory_for_unit(unit, user), 'authorized_keys')
 
 
-def ssh_known_host_key(host, remote_service, user=None):
-    """Search the known_hosts file for a host.
-
-    The known_hosts file is determined by the remote_service key and (optional)
-    user.  Returns None if not found, otherwise the FIRST line from the
-    known_hosts file that contains the host.
-
-    :param host: the host to search for in the known_hosts file
-    :type host: str
-    :param remote_service: the remote service used to determine the known_hosts
-        file.
-    :type remote_service: str
-    :param user: optional user used to determine the known_hosts file.
-    :type user: Union[str, None]
-    :returns: None if not found, otherwise the line from the known_hosts file.
-    :rtype: Union[str, None]
-    """
-    cmd = ['ssh-keygen', '-f',
-           known_hosts(remote_service, user), '-H', '-F', host]
+def ssh_known_host_key(host, unit=None, user=None):
+    cmd = ['ssh-keygen', '-f', known_hosts(unit, user), '-H', '-F', host]
     try:
         # The first line of output is like '# Host xx found: line 1 type RSA',
         # which should be excluded.
-        output = subprocess.check_output(cmd).decode('utf-8').strip()
+        output = subprocess.check_output(cmd).strip()
     except subprocess.CalledProcessError:
         return None
 
@@ -1107,19 +933,9 @@ def ssh_known_host_key(host, remote_service, user=None):
     return None
 
 
-def remove_known_host(host, remote_service, user=None):
-    """Removes ALL keys belonging to host from the specified known_hosts file
-
-    :param host: the host to remove from the specified known_hosts file
-    :type host: str
-    :param remote_service: the remote service used to determine the known_hosts
-        file.
-    :type remote_service: str
-    :param user: optional user used to determine the known_hosts file.
-    :type user: Union[str, None]
-    """
-    hookenv.log('Removing SSH known host entry for compute host at %s' % host)
-    cmd = ['ssh-keygen', '-f', known_hosts(remote_service, user), '-R', host]
+def remove_known_host(host, unit=None, user=None):
+    log('Removing SSH known host entry for compute host at %s' % host)
+    cmd = ['ssh-keygen', '-f', known_hosts(unit, user), '-R', host]
     subprocess.check_call(cmd)
 
 
@@ -1133,327 +949,142 @@ def is_same_key(key_1, key_2):
     return k_1 == k_2
 
 
-def add_known_host(host, remote_service, user=None):
-    """Add variations of host to a specified known hosts file.
-
-    The known_hosts file is determined by the remote_service param passed and
-    (optionally) the user, if it is not None.
-
-    :param host: the host to check
-    :type host: str
-    :param remote_service: the remote service used to determine the known_hosts
-        file.
-    :type remote_service: str
-    :param user: optional user used to determine the known_hosts file.
-    :type user: Union[str, None]
-    :raises: subprocess.CalledProcessError if the ssh-keyscan fails.
-    :raises: UnicodeEncodeError if the output from the ssh-keyscan can't be
-        decoded.
-    """
+def add_known_host(host, unit=None, user=None):
+    '''Add variations of host to a known hosts file.'''
     cmd = ['ssh-keyscan', '-H', '-t', 'rsa', host]
     try:
-        remote_key = subprocess.check_output(cmd).decode('utf-8').strip()
+        remote_key = subprocess.check_output(cmd).strip()
     except Exception as e:
-        hookenv.log('Could not obtain SSH host key from %s' % host,
-                    level=hookenv.ERROR)
+        log('Could not obtain SSH host key from %s' % host, level=ERROR)
         raise e
 
-    current_key = ssh_known_host_key(host, remote_service, user)
+    current_key = ssh_known_host_key(host, unit, user)
     if current_key and remote_key:
         if is_same_key(remote_key, current_key):
-            hookenv.log(
-                'Known host key for compute host %s up to date.' % host)
+            log('Known host key for compute host %s up to date.' % host)
             return
         else:
-            remove_known_host(host, remote_service, user)
+            remove_known_host(host, unit, user)
 
-    hookenv.log('Adding SSH host key to known hosts for compute node at {}.'
-                .format(host))
-    with open(known_hosts(remote_service, user), 'a') as out:
+    log('Adding SSH host key to known hosts for compute node at %s.' % host)
+    with open(known_hosts(unit, user), 'a') as out:
         out.write(remote_key + '\n')
 
 
-def ssh_authorized_key_exists(public_key, remote_service, user=None):
-    """Check if a public key exists in a specified authorized_keys file
-
-    The authorized_keys file is determined by the remote_service param passed
-    and (optionally) the user, if it is not None.
-
-    :param public_key: The public_key to check for in the specified
-        authorized_keys file
-    :type public_key: str
-    :param remote_service: the remote service used to determine the known_hosts
-        file.
-    :type remote_service: str
-    :param user: optional user used to determine the known_hosts file.
-    :type user: Union[str, None]
-    :returns: True if the key is in the specified authorized key file
-    """
-    with open(authorized_keys(remote_service, user)) as keys:
-        return ' {} '.format(public_key) in keys.read()
+def ssh_authorized_key_exists(public_key, unit=None, user=None):
+    with open(authorized_keys(unit, user)) as keys:
+        return (' %s ' % public_key) in keys.read()
 
 
-def add_authorized_key_if_doesnt_exist(public_key,
-                                       remote_service,
-                                       private_address,
-                                       user=None):
-    """Add the public key to the authorized_keys file if it doesn't already
-    exist.
-
-    The authorized_keys file is determined by the remote_service param passed
-    and (optionally) the user, if it is not None.
-
-    If the private_address is None, then the function bails until a further
-    hook makes it available.
-
-    :param public_key: The public_key to add to specified authorized_keys file
-    :type public_key: str
-    :param remote_service: the remote service used to determine the known_hosts
-        file.
-    :type remote_service: str
-    :param private_address: The private address of the unit
-    :type private_address: Union[str, None]
-    :param user: optional user used to determine the known_hosts file.
-    :type user: Union[str, None]
-    """
-    if private_address is None:
-        return
-    if not ssh_authorized_key_exists(public_key, remote_service, user):
-        hookenv.log('Saving SSH authorized key for compute host at %s.' %
-                    private_address)
-        with open(authorized_keys(remote_service, user), 'a') as keys:
-            keys.write(public_key + '\n')
+def add_authorized_key(public_key, unit=None, user=None):
+    with open(authorized_keys(unit, user), 'a') as keys:
+        keys.write(public_key + '\n')
 
 
-def ssh_compute_add_known_hosts(remote_service,
-                                resolved_hosts,
-                                user=None):
-    """Resolve all the host names for the private address, and store it against
-    the remote service (effectively the relation) and an optional user.
+def ssh_compute_add(public_key, rid=None, unit=None, user=None):
+    # If remote compute node hands us a hostname, ensure we have a
+    # known hosts entry for its IP, hostname and FQDN.
+    private_address = relation_get(rid=rid, unit=unit,
+                                   attribute='private-address')
+    hosts = [private_address]
 
-    Note(ajkavanagh) a further patch will remove the remote_service aspect so
-    that the hosts are just stored per user at the target.  However, how to
-    upgrade an existing system still needs to be considered.
+    if not is_ipv6(private_address):
+        if relation_get('hostname'):
+            hosts.append(relation_get('hostname'))
 
-    :param remote_service: The remote service against which to store the hosts
-        file.
-    :type remote_service: str
-    :param resolved_hosts: The hosts to add
-    :type resolved_hosts: List[str]
-    :param user: an optional user against which to store the resolved
-        hostnames.
-    :type user: Union[str, None]
-    """
-    for host in resolved_hosts:
-        # TODO(ajkavanagh) expensive
-        add_known_host(host, remote_service, user)
-
-
-def resolve_hosts_for(private_address, hostname):
-    """Return all of the resolved hosts for a unit
-
-    Using private-address and (if availble) hostname attributes on the
-    relation, create a definite list of hostnames for that unit according to
-    the DNS set up for the system.
-
-    If remote compute node hands us a hostname, ensure we have a known hosts
-    entry for its IP, hostname and FQDN.
-
-    :param private_address: the private address of the unit from its relation
-                            data.
-    :type private_address: Union[str, None]
-    :param hostname: the 'hostname' from the relation data for the unit.
-    :type hostname: str
-    :returns: list of hostname strings
-    :rtype: List[str]
-    """
-    if private_address is None:
-        return []
-
-    db = unitdata.kv()
-    db_key = "hostset-{}".format(private_address)
-    cached_hostset = db.get(db_key, default=None)
-    if hostname:
-        hostname = hostname.lower()
-
-    # only use the cached hostset if the config flag is true
-    if hookenv.config('cache-known-hosts') and cached_hostset is not None:
-        # in the unlikely event that we've already cached the host but the
-        # hostname is now present, add that in.
-        if (not ch_ip.is_ipv6(private_address) and
-                hostname and
-                hostname not in cached_hostset):
-            return cached_hostset + hostname
-        return cached_hostset
-
-    # Use a set to enforce uniqueness; order doesn't matter
-    hosts = set()
-
-    if not ch_ip.is_ipv6(private_address):
-        if hostname:
-            hosts.add(hostname)
-
-        if not ch_utils.is_ip(private_address):
-            hosts.append(private_address.lower())
-            hosts.add(ch_utils.get_host_ip(private_address))
+        if not is_ip(private_address):
+            hosts.append(get_host_ip(private_address))
             short = private_address.split('.')[0]
-            if ch_ip.ns_query(short):
-                hosts.add(short.lower())
+            if ns_query(short):
+                hosts.append(short)
         else:
-            hosts.add(private_address)
-            hn = ch_utils.get_hostname(private_address)
+            hn = get_hostname(private_address)
             if hn:
-                hosts.add(hn.lower())
+                hosts.append(hn)
                 short = hn.split('.')[0]
-                if ch_ip.ns_query(short):
-                    hosts.add(short.lower())
-    else:
-        hosts.add(private_address)
+                if ns_query(short):
+                    hosts.append(short)
 
-    # Note, the cache is maintained regardless of whether the config
-    # 'cache-known-hosts' flag is set; the flag only affects usage and lookup.
-    hosts = list(hosts)
-    db.set(db_key, hosts)
-    db.flush()
+    for host in list(set(hosts)):
+        add_known_host(host, unit, user)
 
-    return hosts
+    if not ssh_authorized_key_exists(public_key, unit, user):
+        log('Saving SSH authorized key for compute host at %s.' %
+            private_address)
+        add_authorized_key(public_key, unit, user)
 
 
-def clear_hostset_cache_for(private_address):
-    """Clear the hostset cache for a private address that refers to a unit.
-
-    :param private_address: the private address corresponding to the unit
-    :type private_address: str
-    """
-    db = unitdata.kv()
-    db_key = "hostset-{}".format(private_address)
-    db.unset(db_key)
-    db.flush()
-
-
-def ssh_known_hosts_lines(remote_service, user=None):
-    """Return a list of known host lines currently stored for the remote
-    service (and optionally the user).
-
-    :param remote_service: the remote service string to store known hosts
-        against
-    :type remote_service: str
-    :param user: the (optional) user to store known hosts against - default
-        none
-    :type user: union[str, None]
-    :returns: stripped list of key (lines) that have been stored for the
-        service/user combination.
-    :rtype: list[str]
-    """
+def ssh_known_hosts_lines(unit=None, user=None):
     known_hosts_list = []
 
-    with open(known_hosts(remote_service, user)) as hosts:
+    with open(known_hosts(unit, user)) as hosts:
         for hosts_line in hosts:
-            stripped_line = hosts_line.rstrip()
-            if stripped_line:
-                known_hosts_list.append(stripped_line)
+            if hosts_line.rstrip():
+                known_hosts_list.append(hosts_line.rstrip())
     return(known_hosts_list)
 
 
-def ssh_authorized_keys_lines(remote_service, user=None):
-    """Return a list of authorized keys lines currently stored for the remote
-    service (and optionally the user).
-
-    :param remote_service: the remote service string to store keys against
-    :type remote_service: str
-    :param user: the (optional) user to store keys against - default none
-    :type user: union[str, None]
-    :returns: stripped list of key (lines) that have been stored for the
-        service/user combination.
-    :rtype: list[str]
-    """
+def ssh_authorized_keys_lines(unit=None, user=None):
     authorized_keys_list = []
 
-    with open(authorized_keys(remote_service, user)) as keys:
+    with open(authorized_keys(unit, user)) as keys:
         for authkey_line in keys:
-            stripped_line = authkey_line.rstrip()
-            if stripped_line:
-                authorized_keys_list.append(stripped_line)
+            if authkey_line.rstrip():
+                authorized_keys_list.append(authkey_line.rstrip())
     return(authorized_keys_list)
 
 
 def ssh_compute_remove(public_key, unit=None, user=None):
-    """Remove a key from the authorized_keys file for the unit/user
-
-    :param public_key: the key to remove
-    :type public_key: str
-    :param unit: The unit (as identified by Juju) to reference (default None)
-    :type unit: Union[str, None]
-    :param user: The username to reference (default None)
-    :type user: Union[str, None]
-    """
-    remote_service = remote_service_from_unit(unit)
-
-    authorized_keys_file = authorized_keys(remote_service, user)
-    if not (os.path.isfile(authorized_keys_file) or
-            os.path.isfile(known_hosts(remote_service, user))):
+    if not (os.path.isfile(authorized_keys(unit, user)) or
+            os.path.isfile(known_hosts(unit, user))):
         return
 
-    with open(authorized_keys_file, 'rt') as f:
-        keys = [k.strip() for k in f.readlines()]
+    with open(authorized_keys(unit, user)) as _keys:
+        keys = [k.strip() for k in _keys.readlines()]
 
     if public_key not in keys:
         return
 
-    with open(authorized_keys_file, 'wt') as f:
-        out = "\n".join([key for key in keys if key != public_key])
-        if not out.endswith('\n'):
-            out += '\n'
-        f.write(out)
+    [keys.remove(key) for key in keys if key == public_key]
+
+    with open(authorized_keys(unit, user), 'w') as _keys:
+        keys = '\n'.join(keys)
+        if not keys.endswith('\n'):
+            keys += '\n'
+        _keys.write(keys)
 
 
 def determine_endpoints(public_url, internal_url, admin_url):
     '''Generates a dictionary containing all relevant endpoints to be
     passed to keystone as relation settings.'''
-    region = hookenv.config('region')
-    os_rel = ch_utils.os_release('nova-common')
-    cmp_os_rel = ch_utils.CompareOpenStackReleases(os_rel)
+    region = config('region')
+    os_rel = os_release('nova-common')
+    cmp_os_rel = CompareOpenStackReleases(os_rel)
 
     nova_public_url = ('%s:%s/v2/$(tenant_id)s' %
-                       (public_url, common.api_port('nova-api-os-compute')))
+                       (public_url, api_port('nova-api-os-compute')))
     nova_internal_url = ('%s:%s/v2/$(tenant_id)s' %
-                         (internal_url,
-                          common.api_port('nova-api-os-compute')))
+                         (internal_url, api_port('nova-api-os-compute')))
     nova_admin_url = ('%s:%s/v2/$(tenant_id)s' %
-                      (admin_url, common.api_port('nova-api-os-compute')))
-    if cmp_os_rel >= 'queens':
-        nova_public_url = (
-            '%s:%s/v2.1' %
-            (public_url, common.api_port('nova-api-os-compute'))
-        )
-        nova_internal_url = (
-            '%s:%s/v2.1' %
-            (internal_url, common.api_port('nova-api-os-compute'))
-        )
-        nova_admin_url = (
-            '%s:%s/v2.1' %
-            (admin_url, common.api_port('nova-api-os-compute'))
-        )
-
+                      (admin_url, api_port('nova-api-os-compute')))
     ec2_public_url = '%s:%s/services/Cloud' % (
-        public_url, common.api_port('nova-api-ec2'))
+        public_url, api_port('nova-api-ec2'))
     ec2_internal_url = '%s:%s/services/Cloud' % (
-        internal_url, common.api_port('nova-api-ec2'))
+        internal_url, api_port('nova-api-ec2'))
     ec2_admin_url = '%s:%s/services/Cloud' % (admin_url,
-                                              common.api_port('nova-api-ec2'))
+                                              api_port('nova-api-ec2'))
 
-    s3_public_url = '%s:%s' % (public_url, common.api_port('nova-objectstore'))
-    s3_internal_url = '%s:%s' % (internal_url,
-                                 common.api_port('nova-objectstore'))
-    s3_admin_url = '%s:%s' % (admin_url, common.api_port('nova-objectstore'))
+    s3_public_url = '%s:%s' % (public_url, api_port('nova-objectstore'))
+    s3_internal_url = '%s:%s' % (internal_url, api_port('nova-objectstore'))
+    s3_admin_url = '%s:%s' % (admin_url, api_port('nova-objectstore'))
 
     if cmp_os_rel >= 'ocata':
         placement_public_url = '%s:%s' % (
-            public_url, common.api_port('nova-placement-api'))
+            public_url, api_port('nova-placement-api'))
         placement_internal_url = '%s:%s' % (
-            internal_url, common.api_port('nova-placement-api'))
+            internal_url, api_port('nova-placement-api'))
         placement_admin_url = '%s:%s' % (
-            admin_url, common.api_port('nova-placement-api'))
+            admin_url, api_port('nova-placement-api'))
 
     # the base endpoints
     endpoints = {
@@ -1504,15 +1135,11 @@ def determine_endpoints(public_url, internal_url, admin_url):
 
 
 def guard_map():
-    """Map of services and required interfaces that must be present before
-    the service should be allowed to start
-
-    :returns: A map of service names to interface names
-    :rtype: Dict[String, String]
-    """
+    '''Map of services and required interfaces that must be present before
+    the service should be allowed to start'''
     gmap = {}
     nova_services = resolve_services()
-    if ch_utils.os_release('nova-common') not in ['essex', 'folsom']:
+    if os_release('nova-common') not in ['essex', 'folsom']:
         nova_services.append('nova-conductor')
 
     nova_interfaces = ['identity-service', 'amqp']
@@ -1525,86 +1152,42 @@ def guard_map():
 
 
 def service_guard(guard_map, contexts, active=False):
-    """Inhibit services in guard_map from running unless required interfaces
-    are found complete in contexts.
-
-    `guard_map`, `contexts` and `active` are all optionally callable so that
-    they don't have to run when the module is loaded.  This allows them to be
-    lazy and ensure that they only need to be evaluated if the decorated
-    function is actually called.
-
-    If `active` is not "truthy" then this decorator just returns the decorated
-    function with no changes.
-
-    :param guard_map: a callable that returns a dict or a dictionary of nova
-        service names <-> interface names
-    :type guard_map: Option[Callable, Dict[String, String]]
-    :param contexts: the map of file name -> {'services' -> [names]},
-        {'contexts' -> context objects}
-    :type contexts: Option[Callable, `:class:templating.OSConfigRenderer`]
-    :param active: Whether this service guard is active or not, optionally
-        callable
-    :type active: Option[Callable, Boolean]
-    :returns: wrapped function
-    :rtype: Callable
-    """
+    '''Inhibit services in guard_map from running unless
+    required interfaces are found complete in contexts.'''
     def wrap(f):
-        _guard_map = None
-        _contexts = None
-        _active = None
-
-        def wrapped_f(*args, **kwargs):
-            nonlocal _active, _contexts, _guard_map
-            if _active is None:
-                if callable(active):
-                    _active = True if active() else False
-                else:
-                    _active = True if active else False
-            if _active:
-                if _guard_map is None:
-                    if callable(guard_map):
-                        _guard_map = guard_map()
-                    else:
-                        _guard_map = guard_map
-                if _contexts is None:
-                    if callable(contexts):
-                        _contexts = contexts()
-                    else:
-                        _contexts = contexts
+        def wrapped_f(*args):
+            if active is True:
                 incomplete_services = []
-                for svc in _guard_map:
-                    for interface in _guard_map[svc]:
-                        if interface not in _contexts.complete_contexts():
+                for svc in guard_map:
+                    for interface in guard_map[svc]:
+                        if interface not in contexts.complete_contexts():
                             incomplete_services.append(svc)
-                ret = f(*args, **kwargs)
+                f(*args)
                 for svc in incomplete_services:
-                    if ch_host.service_running(svc):
-                        hookenv.log(
-                            'Service {} has unfulfilled '
+                    if service_running(svc):
+                        log('Service {} has unfulfilled '
                             'interface requirements, stopping.'.format(svc))
-                        ch_host.service_stop(svc)
-                return ret
+                        service_stop(svc)
             else:
-                return f(*args, **kwargs)
+                f(*args)
         return wrapped_f
     return wrap
 
 
 def setup_ipv6():
-    ubuntu_rel = ch_host.lsb_release()['DISTRIB_CODENAME'].lower()
-    if ch_host.CompareHostReleases(ubuntu_rel) < "trusty":
+    ubuntu_rel = lsb_release()['DISTRIB_CODENAME'].lower()
+    if CompareHostReleases(ubuntu_rel) < "trusty":
         raise Exception("IPv6 is not supported in the charms for Ubuntu "
                         "versions less than Trusty 14.04")
 
     # Need haproxy >= 1.5.3 for ipv6 so for Trusty if we are <= Kilo we need to
     # use trusty-backports otherwise we can use the UCA.
     if (ubuntu_rel == 'trusty' and
-            ch_utils.CompareOpenStackReleases(
-                ch_utils.os_release('nova-api')) < 'liberty'):
-        ch_fetch.add_source(
-            'deb http://archive.ubuntu.com/ubuntu trusty-backports main')
-        ch_fetch.apt_update()
-        ch_fetch.apt_install('haproxy/trusty-backports', fatal=True)
+            CompareOpenStackReleases(os_release('nova-api')) < 'liberty'):
+        add_source('deb http://archive.ubuntu.com/ubuntu trusty-backports '
+                   'main')
+        apt_update()
+        apt_install('haproxy/trusty-backports', fatal=True)
 
 
 def get_optional_interfaces():
@@ -1614,14 +1197,12 @@ def get_optional_interfaces():
     :returns: {general_interface: [specific_int1, specific_int2, ...], ...}
     """
     optional_interfaces = {}
-    if hookenv.relation_ids('quantum-network-service'):
+    if relation_ids('quantum-network-service'):
         optional_interfaces['quantum'] = ['quantum-network-service']
-    if hookenv.relation_ids('cinder-volume-service'):
+    if relation_ids('cinder-volume-service'):
         optional_interfaces['cinder'] = ['cinder-volume-service']
-    if hookenv.relation_ids('neutron-api'):
+    if relation_ids('neutron-api'):
         optional_interfaces['neutron-api'] = ['neutron-api']
-    if hookenv.relation_ids('ha'):
-        optional_interfaces['memcache'] = ['memcache']
 
     return optional_interfaces
 
@@ -1637,16 +1218,20 @@ def check_optional_relations(configs):
     :param configs: an OSConfigRender() instance.
     :return 2-tuple: (string, string) = (status, message)
     """
-    if hookenv.relation_ids('ha'):
+    if relation_ids('ha'):
         try:
-            ch_cluster.get_hacluster_config()
-        except Exception:
+            get_hacluster_config()
+        except:
             return ('blocked',
                     'hacluster missing configuration: '
                     'vip, vip_iface, vip_cidr')
     # return 'unknown' as the lowest priority to not clobber an existing
     # status.
     return "unknown", ""
+
+
+def is_api_ready(configs):
+    return (not incomplete_relation_data(configs, REQUIRED_INTERFACES))
 
 
 def assess_status(configs):
@@ -1659,11 +1244,8 @@ def assess_status(configs):
     @param configs: a templating.OSConfigRenderer() object
     @returns None - this function is executed for its side-effect
     """
-    # Add the cell context as its not used for rendering files, only for
-    # assessing status.
-    configs.register('', [nova_cc_context.NovaCellV2Context()])
     assess_status_func(configs)()
-    ch_utils.os_application_version_set(VERSION_PACKAGE)
+    os_application_version_set(VERSION_PACKAGE)
 
 
 def assess_status_func(configs):
@@ -1686,7 +1268,7 @@ def assess_status_func(configs):
     """
     required_interfaces = REQUIRED_INTERFACES.copy()
     required_interfaces.update(get_optional_interfaces())
-    return ch_utils.make_assess_status_func(
+    return make_assess_status_func(
         configs, required_interfaces,
         charm_func=check_optional_relations,
         services=services(), ports=None)
@@ -1699,7 +1281,7 @@ def pause_unit_helper(configs):
     @param configs: a templating.OSConfigRenderer() object
     @returns None - this function is executed for its side-effect
     """
-    _pause_resume_helper(ch_utils.pause_unit, configs)
+    _pause_resume_helper(pause_unit, configs)
 
 
 def resume_unit_helper(configs):
@@ -1709,7 +1291,7 @@ def resume_unit_helper(configs):
     @param configs: a templating.OSConfigRenderer() object
     @returns None - this function is executed for its side-effect
     """
-    _pause_resume_helper(ch_utils.resume_unit, configs)
+    _pause_resume_helper(resume_unit, configs)
 
 
 def _pause_resume_helper(f, configs):
@@ -1734,16 +1316,16 @@ def update_aws_compat_services():
     `nova-objectstore` services.
     """
     # if packages aren't installed, then there is nothing to do
-    if ch_fetch.filter_installed_packages(AWS_COMPAT_SERVICES) != []:
+    if filter_installed_packages(AWS_COMPAT_SERVICES) != []:
         return
 
-    if hookenv.config('disable-aws-compat'):
+    if config('disable-aws-compat'):
         # TODO: the endpoints have to removed from keystone
         for service_ in AWS_COMPAT_SERVICES:
-            ch_host.service_pause(service_)
+            service_pause(service_)
     else:
         for service_ in AWS_COMPAT_SERVICES:
-            ch_host.service_resume(service_)
+            service_resume(service_)
 
 
 def serial_console_settings():
@@ -1755,193 +1337,12 @@ def serial_console_settings():
 
 def placement_api_enabled():
     """Return true if nova-placement-api is enabled in this release"""
-    return ch_utils.CompareOpenStackReleases(
-        ch_utils.os_release('nova-common')) >= 'ocata'
+    return CompareOpenStackReleases(os_release('nova-common')) >= 'ocata'
 
 
-def enable_metadata_api(release=None):
-    """Should nova-metadata-api be running on this unit for this release."""
-    if not release:
-        release = ch_utils.os_release('nova-common')
-    return ch_utils.CompareOpenStackReleases(release) >= 'rocky'
-
-
-def disable_package_apache_site(service_reload=False):
-    """Ensure the package-provided apache2 configuration is disabled.
-
-    This ensures the package-provided apache2 configuration doesn't
-    conflict with the charm-provided version.
-
-    :param service_reload: Boolean that indicates the service should
-    be reloaded if a change occurred in sites-enabled.
-
+def disable_package_apache_site():
+    """Ensure that the package-provided apache configuration is disabled to
+    prevent it from conflicting with the charm-provided version.
     """
-    site_changed = False
-    if placement_api_enabled():
-        if os.path.exists(PACKAGE_NOVA_PLACEMENT_API_CONF):
-            subprocess.check_call(['a2dissite', 'nova-placement-api'])
-            site_changed = True
-        if os.path.exists(OLD_WSGI_NOVA_PLACEMENT_API_CONF):
-            # wsgi-openstack-api.conf is generated is copied as a plain
-            # text to sites-enables. a2dissite does not accept to remove
-            # "file" that is not symlink from sites-available.
-            os.remove(OLD_WSGI_NOVA_PLACEMENT_API_CONF)
-            site_changed = True
-    if os.path.exists(PACKAGE_NOVA_API_OS_COMPUTE_CONF):
-        # Even if using systemd or apache for the service we want
-        # remove the conf created by the package installed if exists
-        subprocess.check_call(['a2dissite', 'nova-api-os-compute'])
-        site_changed = True
-
-    if site_changed and service_reload:
-        ch_host.service_reload('apache2', restart_on_failure=True)
-
-
-def stop_deprecated_services():
-    """Stop services that are not used anymore.
-
-    Note: It may be important to also disable the service, see:
-    resource_map.
-    """
-    release = ch_utils.os_release('nova-common')
-    if ch_utils.CompareOpenStackReleases(release) >= 'rocky':
-        ch_host.service_pause('nova-api-os-compute')
-
-
-def get_shared_metadatasecret():
-    """Return the shared metadata secret."""
-    return hookenv.leader_get(SHARED_METADATA_SECRET_KEY)
-
-
-def set_shared_metadatasecret():
-    """Store the shared metadata secret."""
-    hookenv.leader_set({SHARED_METADATA_SECRET_KEY: uuid.uuid1()})
-
-
-def get_metadata_settings(configs):
-    """Return the settings for accessing the metadata service."""
-    if enable_metadata_api():
-        url = urlparse(
-            ch_openstack_ip.canonical_url(configs, ch_openstack_ip.INTERNAL))
-        settings = {
-            'nova-metadata-host': url.netloc,
-            'nova-metadata-protocol': url.scheme,
-            'nova-metadata-port': common.api_port('nova-api-metadata'),
-            'shared-metadata-secret': get_shared_metadatasecret()}
-    else:
-        settings = {}
-    return settings
-
-
-def get_cell_db_context(db_service):
-    """Return the database context for the given service name"""
-    db_rid = hookenv.relation_id(
-        relation_name='shared-db-cell',
-        service_or_unit=db_service)
-    if not db_rid:
-        return {}
-    return ch_context.SharedDBContext(
-        relation_prefix='nova',
-        ssl_dir=NOVA_CONF_DIR,
-        relation_id=db_rid)()
-
-
-def get_cell_amqp_context(amqp_service):
-    """Return the amqp context for the given service name"""
-    amq_rid = hookenv.relation_id(
-        relation_name='amqp-cell',
-        service_or_unit=amqp_service)
-    if not amq_rid:
-        return {}
-    return ch_context.AMQPContext(
-        ssl_dir=NOVA_CONF_DIR,
-        relation_id=amq_rid)()
-
-
-def get_sql_uri(db_ctxt):
-    """Return the uri for conextind to the database in the supplied context"""
-    uri_template = ("{database_type}://{database_user}:{database_password}"
-                    "@{database_host}/{database}")
-    uri = uri_template.format(**db_ctxt)
-    if db_ctxt.get('database_ssl_ca'):
-        uri = uri + '?ssl_ca={database_ssl_ca}'.format(**db_ctxt)
-        if db_ctxt.get('database_ssl_cert'):
-            uri = uri + ('&ssl_cert={database_ssl_cert}'
-                         '&ssl_key={database_ssl_key}').format(**db_ctxt)
-    return uri
-
-
-def update_child_cell(name, db_service, amqp_service, skip_acl_check=True):
-    """Register cell.
-
-    Registering a cell requires:
-        1) Complete relation with api db service.
-        2) Complete relation with cells db service.
-        3) Complete relation with cells amqp service.
-    """
-    if not is_db_initialised():
-        hookenv.log(
-            'Defering registering Cell {}, api db not ready.'.format(name),
-            level=hookenv.DEBUG)
-        return False
-
-    existing_cells = get_cell_details()
-    if not existing_cells.get('cell1'):
-        hookenv.log(
-            'Defering registering cell {}, api cell setup is not complete.'
-            .format(name), level=hookenv.DEBUG)
-        return False
-
-    db_ctxt = get_cell_db_context(db_service)
-    if not db_ctxt:
-        hookenv.log(
-            'Defering registering cell {}, cell db relation not ready.'
-            .format(name), level=hookenv.DEBUG)
-        return False
-    sql_connection = get_sql_uri(db_ctxt)
-
-    amqp_ctxt = get_cell_amqp_context(amqp_service)
-    if not amqp_ctxt:
-        hookenv.log(
-            'Defering registering cell {}, cell amqp relation not ready.'
-            .format(name), level=hookenv.DEBUG)
-        return False
-
-    cmd = [
-        'nova-manage',
-        'cell_v2',
-    ]
-
-    if existing_cells.get(name):
-        hookenv.log(
-            'Cell {} already registered, checking if details are correct.'
-            .format(name), level=hookenv.DEBUG)
-        if (amqp_ctxt['transport_url'] == existing_cells[name]['amqp'] and
-           sql_connection == existing_cells[name]['db']):
-            hookenv.log('Cell details are correct no update needed',
-                        level=hookenv.DEBUG)
-            return False
-        else:
-            hookenv.log('Cell details have changed', level=hookenv.DEBUG)
-            cmd.extend([
-                'update_cell',
-                '--cell_uuid', existing_cells[name]['uuid']])
-    else:
-        hookenv.log(
-            'Cell {} is new and needs to be created.'.format(name),
-            level=hookenv.DEBUG)
-        cmd.extend(['create_cell', '--verbose'])
-
-    cmd.extend([
-        '--name', name,
-        '--transport-url', amqp_ctxt['transport_url'],
-        '--database_connection', sql_connection])
-    try:
-        hookenv.log('Updating cell {}'.format(name), level=hookenv.DEBUG)
-        subprocess.check_output(cmd)
-    except subprocess.CalledProcessError as e:
-        hookenv.log('Register cell failed\n{}'.format(e.output),
-                    level=hookenv.ERROR)
-        raise
-    ch_host.service_restart('nova-scheduler')
-    return True
+    if os.path.exists(PACKAGE_NOVA_PLACEMENT_API_CONF):
+        subprocess.check_call(['a2dissite', 'nova-placement-api'])

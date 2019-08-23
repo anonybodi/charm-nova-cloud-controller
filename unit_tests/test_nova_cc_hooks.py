@@ -12,65 +12,84 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from mock import MagicMock, patch, call
 import os
 import tempfile
 
-from unit_tests.test_utils import CharmTestCase
+from mock import MagicMock, patch, call
+from test_utils import CharmTestCase
 
-import charmhelpers.contrib.hardening.harden as harden
+with patch('charmhelpers.core.hookenv.config') as config:
+    with patch('charmhelpers.contrib.openstack.utils.get_os_codename_package'):
+        config.return_value = 'neutron'
+        import nova_cc_utils as utils
 
-import hooks.nova_cc_utils as utils
-import hooks.nova_cc_hooks as hooks
+_reg = utils.register_configs
+_map = utils.restart_map
 
+utils.register_configs = MagicMock()
+utils.restart_map = MagicMock()
+
+with patch('charmhelpers.contrib.hardening.harden.harden') as mock_dec:
+    mock_dec.side_effect = (lambda *dargs, **dkwargs: lambda f:
+                            lambda *args, **kwargs: f(*args, **kwargs))
+    with patch('nova_cc_utils.guard_map') as gmap:
+        with patch('charmhelpers.core.hookenv.config') as config:
+            config.return_value = False
+            gmap.return_value = {}
+            import nova_cc_hooks as hooks
+
+utils.register_configs = _reg
+utils.restart_map = _map
 
 TO_PATCH = [
-    'charmhelpers.contrib.hahelpers.cluster.get_hacluster_config',
-    'charmhelpers.contrib.hahelpers.cluster.is_clustered',
-    'charmhelpers.contrib.network.ip.get_iface_for_address',
-    'charmhelpers.contrib.network.ip.get_netmask_for_address',
-    'charmhelpers.contrib.network.ip.get_relation_ip',
-    'charmhelpers.contrib.openstack.ha.utils.generate_ha_relation_data',
-    'charmhelpers.contrib.openstack.ha.utils.update_dns_ha_resource_params',
-    'charmhelpers.contrib.openstack.neutron.network_manager',
-    'charmhelpers.contrib.openstack.utils.configure_installation_source',
-    'charmhelpers.contrib.openstack.utils.config_value_changed',
-    'charmhelpers.contrib.openstack.utils.is_unit_paused_set',
-    'charmhelpers.contrib.openstack.utils.openstack_upgrade_available',
-    'charmhelpers.contrib.openstack.utils.os_release',
-    'charmhelpers.core.hookenv.charm_dir',
-    'charmhelpers.core.hookenv.config',
-    'charmhelpers.core.hookenv.is_leader',
-    'charmhelpers.core.hookenv.is_relation_made',
-    'charmhelpers.core.hookenv.local_unit',
-    'charmhelpers.core.hookenv.log',
-    'charmhelpers.core.hookenv.open_port',
-    'charmhelpers.core.hookenv.related_units',
-    'charmhelpers.core.hookenv.relation_get',
-    'charmhelpers.core.hookenv.relation_ids',
-    'charmhelpers.core.hookenv.relation_set',
-    'charmhelpers.core.hookenv.status_set',
-    'charmhelpers.core.hookenv.unit_get',
-    'charmhelpers.core.host.service_pause',
-    'charmhelpers.core.host.service_reload',
-    'charmhelpers.core.host.service_resume',
-    'charmhelpers.fetch.apt_install',
-    'charmhelpers.fetch.apt_update',
-    'charmhelpers.payload.execd.execd_preinstall',
-    'hooks.nova_cc_utils.determine_endpoints',
-    'hooks.nova_cc_utils.determine_packages',
-    'hooks.nova_cc_utils.determine_ports',
-    'hooks.nova_cc_utils.do_openstack_upgrade',
-    'hooks.nova_cc_utils.keystone_ca_cert_b64',
-    'hooks.nova_cc_utils.migrate_nova_databases',
-    'hooks.nova_cc_utils.placement_api_enabled',
-    'hooks.nova_cc_utils.save_script_rc',
-    'hooks.nova_cc_utils.serial_console_settings',
-    'hooks.nova_cc_utils.services',
-    'hooks.nova_cc_utils.ssh_authorized_keys_lines',
-    'hooks.nova_cc_utils.ssh_compute_add_known_hosts',
-    'hooks.nova_cc_utils.ssh_known_hosts_lines',
+    'apt_update',
+    'apt_install',
+    'configure_installation_source',
+    'charm_dir',
+    'do_openstack_upgrade',
+    'openstack_upgrade_available',
+    'config',
+    'config_value_changed',
+    'determine_endpoints',
+    'determine_packages',
+    'determine_ports',
+    'NovaCellContext',
+    'open_port',
+    'is_relation_made',
+    'is_unit_paused_set',
+    'local_unit',
+    'log',
+    'os_release',
+    'related_units',
+    'relation_get',
+    'relation_set',
+    'relation_ids',
+    'placement_api_enabled',
+    'ssh_compute_add',
+    'ssh_known_hosts_lines',
+    'ssh_authorized_keys_lines',
+    'save_script_rc',
+    'service_pause',
+    'service_reload',
+    'service_resume',
+    'services',
+    'execd_preinstall',
+    'network_manager',
+    'unit_get',
     'uuid',
+    'is_leader',
+    'keystone_ca_cert_b64',
+    'migrate_nova_databases',
+    'uuid',
+    'get_hacluster_config',
+    'get_iface_for_address',
+    'get_netmask_for_address',
+    'update_nrpe_config',
+    'status_set',
+    'update_dns_ha_resource_params',
+    'serial_console_settings',
+    'get_relation_ip',
+    'is_clustered',
 ]
 
 
@@ -94,13 +113,9 @@ class NovaCCHooksTests(CharmTestCase):
         super(NovaCCHooksTests, self).setUp(hooks, TO_PATCH)
         (tmpfd, hooks.NOVA_CONSOLEAUTH_OVERRIDE) = tempfile.mkstemp()
 
-        hooks.CONFIGS = None  # reset for each test
         self.config.side_effect = self.test_config.get
         self.relation_get.side_effect = self.test_relation.get
         self.charm_dir.return_value = '/var/lib/juju/charms/nova/charm'
-        self.is_unit_paused_set.return_value = False
-        # disable hardening for unit tests
-        harden._DISABLE_HARDENING_FOR_UNIT_TEST = True
 
     def tearDown(self):
         try:
@@ -111,7 +126,6 @@ class NovaCCHooksTests(CharmTestCase):
         super(NovaCCHooksTests, self).tearDown()
 
     def test_install_hook(self):
-        self.os_release.return_value = 'rocky'
         self.determine_packages.return_value = [
             'nova-scheduler', 'nova-api-ec2']
         self.determine_ports.return_value = [80, 81, 82]
@@ -123,178 +137,126 @@ class NovaCCHooksTests(CharmTestCase):
         self.assertTrue(self.execd_preinstall.called)
         self.assertTrue(self.service_pause.called)
 
-    @patch.object(utils, 'set_shared_metadatasecret')
-    @patch.object(utils, 'get_shared_metadatasecret')
-    @patch.object(hooks, 'update_nrpe_config')
-    @patch.object(utils, 'resource_map')
-    @patch('hooks.nova_cc_utils.update_aws_compat_services')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
-    @patch('charmhelpers.fetch.filter_installed_packages')
+    @patch.object(hooks, 'update_aws_compat_services')
+    @patch.object(hooks, 'update_nova_consoleauth_config')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'determine_packages')
+    @patch.object(utils, 'service_resume')
+    @patch.object(utils, 'config')
+    @patch.object(hooks, 'filter_installed_packages')
     @patch.object(hooks, 'configure_https')
     def test_config_changed_no_upgrade(self, conf_https, mock_filter_packages,
+                                       utils_config, mock_service_resume,
+                                       mock_determine_packages,
                                        mock_is_db_initialised,
-                                       mock_update_aws_compat_services,
-                                       mock_resource_map,
-                                       mock_update_nrpe_config,
-                                       mock_get_shared_metadatasecret,
-                                       mock_set_shared_metadatasecret):
-        mock_resource_map.return_value = {}
-        self.get_shared_metadatasecret = None
-        self.determine_packages.return_value = []
-        self.is_leader.return_value = True
+                                       mock_update_nova_consoleauth_config,
+                                       mock_update_aws_compat_services):
+        mock_determine_packages.return_value = []
+        utils_config.side_effect = self.test_config.get
         self.test_config.set('console-access-protocol', 'dummy')
         self.openstack_upgrade_available.return_value = False
         mock_is_db_initialised.return_value = False
         self.os_release.return_value = 'diablo'
-        hooks.resolve_CONFIGS()
         hooks.config_changed()
         self.assertTrue(self.save_script_rc.called)
         mock_filter_packages.assert_called_with([])
+        self.assertTrue(mock_update_nova_consoleauth_config.called)
         self.assertTrue(mock_update_aws_compat_services.called)
 
-    @patch.object(utils, 'set_shared_metadatasecret')
-    @patch.object(utils, 'get_shared_metadatasecret')
-    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    @patch.object(hooks, 'update_nrpe_config')
-    @patch('hooks.nova_cc_utils.update_aws_compat_services')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
-    @patch('charmhelpers.fetch.filter_installed_packages')
-    @patch.object(hooks, 'configure_https')
-    def test_config_changed_ocata(self,
-                                  conf_https,
-                                  mock_filter_packages,
-                                  mock_is_db_initialised,
-                                  mock_update_aws_compat_services,
-                                  mock_update_nrpe_config,
-                                  mock_sub_ctxt,
-                                  mock_get_shared_metadatasecret,
-                                  mock_set_shared_metadatasecret):
-        mock_get_shared_metadatasecret.return_value = None
-        self.is_leader.return_value = True
-        self.determine_packages.return_value = []
-        self.test_config.set('console-access-protocol', 'dummy')
-        self.openstack_upgrade_available.return_value = False
-        mock_is_db_initialised.return_value = False
-        self.os_release.return_value = 'diablo'
-        hooks.resolve_CONFIGS()
-        # probably need the with patch.object from below
-        with patch.object(hooks.CONFIGS, 'write_all') as wa:
-            hooks.config_changed()
-            self.assertTrue(wa.called)
-        self.assertTrue(self.save_script_rc.called)
-        mock_filter_packages.assert_called_with([])
-        self.assertTrue(mock_update_aws_compat_services.called)
-        mock_set_shared_metadatasecret.assert_called_once_with()
-
-    @patch.object(utils, 'set_shared_metadatasecret')
-    @patch.object(utils, 'get_shared_metadatasecret')
-    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    @patch.object(hooks, 'update_nrpe_config')
-    @patch('hooks.nova_cc_utils.update_aws_compat_services')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
-    @patch('charmhelpers.fetch.filter_installed_packages')
+    @patch.object(hooks, 'update_aws_compat_services')
+    @patch.object(hooks, 'update_nova_consoleauth_config')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'determine_packages')
+    @patch.object(utils, 'service_resume')
+    @patch.object(utils, 'config')
+    @patch.object(hooks, 'filter_installed_packages')
     @patch.object(hooks, 'configure_https')
     def test_config_changed_no_upgrade_juno(self, conf_https,
                                             mock_filter_packages,
+                                            utils_config, mock_service_resume,
+                                            mock_determine_packages,
                                             mock_is_db_initialised,
-                                            mock_update_aws_compat_services,
-                                            mock_update_nrpe_config,
-                                            mock_sub_ctxt,
-                                            mock_get_shared_metadatasecret,
-                                            mock_set_shared_metadatasecret):
-        self.determine_packages.return_value = []
+                                            mock_update_nova_consoleauth_cfg,
+                                            mock_update_aws_compat_services):
+        mock_determine_packages.return_value = []
+        utils_config.side_effect = self.test_config.get
         self.test_config.set('console-access-protocol', 'dummy')
         self.openstack_upgrade_available.return_value = False
         mock_is_db_initialised.return_value = False
         self.os_release.return_value = 'juno'
-        hooks.resolve_CONFIGS()
-        with patch.object(hooks.CONFIGS, 'write_all') as wa:
-            hooks.config_changed()
-            self.assertTrue(wa.called)
+        hooks.config_changed()
         self.assertTrue(self.save_script_rc.called)
         mock_filter_packages.assert_called_with([])
+        self.assertTrue(mock_update_nova_consoleauth_cfg.called)
         self.assertTrue(mock_update_aws_compat_services.called)
         self.service_pause.assert_called_with('neutron-server')
 
-    @patch.object(utils, 'set_shared_metadatasecret')
-    @patch.object(utils, 'get_shared_metadatasecret')
-    @patch.object(hooks, 'update_nrpe_config')
-    @patch.object(utils, 'resource_map')
-    @patch('charmhelpers.contrib.openstack.context.SubordinateConfigContext')
-    @patch('hooks.nova_cc_utils.update_aws_compat_services')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
-    @patch('charmhelpers.fetch.filter_installed_packages')
+    @patch.object(hooks, 'update_aws_compat_services')
+    @patch.object(hooks, 'update_nova_consoleauth_config')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'determine_packages')
+    @patch.object(utils, 'service_resume')
+    @patch.object(utils, 'config')
+    @patch.object(hooks, 'filter_installed_packages')
     @patch.object(hooks, 'configure_https')
     def test_config_changed_no_upgrade_juno_no_neutron_server(
-            self,
-            conf_https,
-            mock_filter_packages,
+            self, conf_https, mock_filter_packages,
+            utils_config, mock_service_resume,
+            mock_determine_packages,
             mock_is_db_initialised,
-            mock_update_aws_compat_services,
-            mock_sub_ctxt,
-            mock_resource_map,
-            mock_update_nrpe_config,
-            mock_get_shared_metadatasecret,
-            mock_set_shared_metadatasecret):
-        mock_resource_map.return_value = {}
-        self.determine_packages.return_value = []
+            mock_update_nova_consoleauth_cfg,
+            mock_update_aws_compat_services):
+        mock_determine_packages.return_value = []
+        utils_config.side_effect = self.test_config.get
         self.test_config.set('console-access-protocol', 'dummy')
         self.openstack_upgrade_available.return_value = False
         mock_is_db_initialised.return_value = False
         self.os_release.return_value = 'juno'
         self.service_pause.side_effect = ValueError
-        hooks.resolve_CONFIGS()
-        with patch.object(hooks.CONFIGS, 'write_all'):
-            hooks.config_changed()
+        hooks.config_changed()
         self.assertTrue(self.save_script_rc.called)
         mock_filter_packages.assert_called_with([])
+        self.assertTrue(mock_update_nova_consoleauth_cfg.called)
         self.assertTrue(mock_update_aws_compat_services.called)
         self.service_pause.assert_called_with('neutron-server')
 
-    @patch.object(utils, 'set_shared_metadatasecret')
-    @patch.object(utils, 'get_shared_metadatasecret')
-    @patch.object(hooks, 'update_nrpe_config')
-    @patch.object(utils, 'resource_map')
-    @patch('hooks.nova_cc_utils.update_aws_compat_services')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
+    @patch.object(hooks, 'update_aws_compat_services')
+    @patch.object(hooks, 'update_nova_consoleauth_config')
+    @patch.object(hooks, 'is_db_initialised')
     @patch.object(hooks, 'quantum_joined')
+    @patch.object(hooks, 'determine_packages')
+    @patch.object(utils, 'service_resume')
     @patch('charmhelpers.contrib.openstack.ip.unit_get')
     @patch('charmhelpers.contrib.hahelpers.cluster.relation_ids')
+    @patch.object(utils, 'config')
     @patch.object(hooks, 'db_joined')
-    @patch('charmhelpers.fetch.filter_installed_packages')
+    @patch.object(hooks, 'filter_installed_packages')
     @patch('charmhelpers.contrib.openstack.ip.service_name',
            lambda *args: 'nova-cloud-controller')
     @patch.object(hooks, 'cluster_joined')
     @patch.object(hooks, 'identity_joined')
     @patch.object(hooks, 'neutron_api_relation_joined')
     @patch.object(hooks, 'configure_https')
-    @patch.object(hooks, 'compute_joined')
-    @patch.object(hooks, 'nova_cell_api_relation_joined')
-    def test_config_changed_with_upgrade(self,
-                                         mock_nova_cell_api_relation_joined,
-                                         mock_compute_joined,
-                                         conf_https, neutron_api_joined,
+    def test_config_changed_with_upgrade(self, conf_https, neutron_api_joined,
                                          identity_joined, cluster_joined,
                                          mock_filter_packages, db_joined,
-                                         mock_relids,
+                                         utils_config, mock_relids,
                                          mock_unit_get,
+                                         mock_service_resume,
+                                         mock_determine_packages,
                                          mock_quantum_joined,
                                          mock_is_db_initialised,
-                                         mock_update_aws_compat_services,
-                                         mock_resource_map,
-                                         mock_update_nrpe_config,
-                                         mock_get_shared_metadatasecret,
-                                         mock_set_shared_metadatasecret):
-        mock_resource_map.return_value = {}
-        self.determine_packages.return_value = []
+                                         mock_update_nova_consoleauth_config,
+                                         mock_update_aws_compat_services):
+        mock_determine_packages.return_value = []
         mock_is_db_initialised.return_value = False
         self.openstack_upgrade_available.return_value = True
         self.relation_ids.return_value = ['generic_rid']
+        utils_config.side_effect = self.test_config.get
         self.test_config.set('console-access-protocol', 'dummy')
         mock_relids.return_value = []
         mock_unit_get.return_value = '127.0.0.1'
         self.os_release.return_value = 'diablo'
-        hooks.resolve_CONFIGS()
         hooks.config_changed()
         self.assertTrue(self.do_openstack_upgrade.called)
         self.assertTrue(neutron_api_joined.called)
@@ -304,138 +266,51 @@ class NovaCCHooksTests(CharmTestCase):
         self.assertTrue(self.save_script_rc.called)
         mock_filter_packages.assert_called_with([])
         self.assertTrue(mock_quantum_joined.called)
+        self.assertTrue(mock_update_nova_consoleauth_config.called)
         self.assertTrue(mock_update_aws_compat_services.called)
 
-    @patch.object(utils, 'set_shared_metadatasecret')
-    @patch.object(utils, 'get_shared_metadatasecret')
-    @patch.object(hooks, 'update_nrpe_config')
-    @patch.object(utils, 'resource_map')
-    @patch('charmhelpers.contrib.hahelpers.cluster.relation_ids')
-    @patch('hooks.nova_cc_utils.update_aws_compat_services')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
-    @patch('charmhelpers.fetch.filter_installed_packages')
+    @patch.object(hooks, 'update_aws_compat_services')
+    @patch.object(hooks, 'update_nova_consoleauth_config')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(utils, 'service_resume')
+    @patch.object(hooks, 'filter_installed_packages')
     @patch.object(hooks, 'configure_https')
-    @patch.object(hooks, 'compute_joined')
-    @patch.object(hooks, 'set_region_on_relation_from_config')
-    def test_config_changed_region_change(
-            self,
-            mock_set_region_on_relation_from_config,
-            mock_compute_joined,
-            mock_config_https,
-            mock_filter_packages,
-            mock_is_db_initialised,
-            mock_update_aws_compat_services,
-            mock_relation_ids,
-            mock_resource_map,
-            mock_update_nrpe_config,
-            mock_get_shared_metadatasecret,
-            mock_set_shared_metadatasecret):
-        mock_resource_map.return_value = {}
+    @patch.object(hooks, 'compute_changed')
+    def test_config_changed_region_change(self, mock_compute_changed,
+                                          mock_config_https,
+                                          mock_filter_packages,
+                                          mock_service_resume,
+                                          mock_is_db_initialised,
+                                          mock_update_nova_consoleauth_config,
+                                          mock_update_aws_compat_services):
         self.openstack_upgrade_available.return_value = False
         self.config_value_changed.return_value = True
         self.related_units.return_value = ['unit/0']
         self.relation_ids.side_effect = \
             lambda x: ['generic_rid'] if x == 'cloud-compute' else []
-        mock_set_region_on_relation_from_config.return_value = False
+        mock_is_db_initialised.return_value = False
         self.os_release.return_value = 'diablo'
-        hooks.resolve_CONFIGS()
         hooks.config_changed()
-        mock_set_region_on_relation_from_config.assert_has_calls(
-            [call('generic_rid')])
-        mock_compute_joined.assert_has_calls(
-            [call(rid='generic_rid', remote_restart=False)])
+        mock_compute_changed.assert_has_calls([call('generic_rid', 'unit/0')])
+        self.assertTrue(mock_update_nova_consoleauth_config.called)
         self.assertTrue(mock_update_aws_compat_services.called)
 
-    @patch.object(hooks, 'add_hosts_to_cell_when_ready')
-    @patch.object(hooks, 'set_region_on_relation_from_config')
-    @patch.object(hooks, 'update_ssh_keys_and_notify_compute_units')
-    def test_cloud_compute_relation_changed(
-            self,
-            mock_update_ssh_keys_and_notify_compute_units,
-            mock_set_region_on_relation_from_config,
-            mock_add_hosts_to_cell_when_ready):
-        hooks.cloud_compute_relation_changed()
-        mock_add_hosts_to_cell_when_ready.assert_called_once_with()
-        mock_set_region_on_relation_from_config.assert_called_once_with(
-            rid=None)
-        mock_update_ssh_keys_and_notify_compute_units.assert_called_once_with(
-            rid=None, unit=None)
+    @patch.object(hooks, 'is_cellv2_init_ready')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'nova_api_relation_joined')
+    def test_compute_changed_nova_api_trigger(self, api_joined,
+                                              mock_is_db_initialised,
+                                              mock_is_cellv2_init_ready):
+        self.relation_ids.return_value = ['nova-api/0']
+        mock_is_db_initialised.return_value = False
+        mock_is_cellv2_init_ready.return_value = False
+        hooks.compute_changed()
+        api_joined.assert_called_with(rid='nova-api/0')
 
-    @patch('charmhelpers.core.hookenv.related_units')
-    @patch('charmhelpers.core.hookenv.expected_related_units')
-    def test__goal_state_achieved_for_relid__goal_state_not_available(
-            self, mock_expected_related_units, mock_related_units):
-        mock_related_units.return_value = ['service/0']
-
-        def _side_effect(*_, **__):
-            raise NotImplementedError()
-
-        mock_expected_related_units.side_effect = _side_effect
-        self.assertTrue(hooks._goal_state_achieved_for_relid('aservice', None))
-
-    @patch('charmhelpers.core.hookenv.related_units')
-    @patch('charmhelpers.core.hookenv.expected_related_units')
-    def test__goal_state_achieved_for_relid__goal_state_key_error(
-            self, mock_expected_related_units, mock_related_units):
-        mock_related_units.return_value = ['service/0']
-
-        def _side_effect(*_, **__):
-            raise KeyError()
-
-        mock_expected_related_units.side_effect = _side_effect
-        self.assertFalse(
-            hooks._goal_state_achieved_for_relid('aservice', None))
-
-    @patch('charmhelpers.core.hookenv.related_units')
-    @patch('charmhelpers.core.hookenv.expected_related_units')
-    def test__goal_state_achieved_for_relid__goal_state_no_related_units_yet(
-            self, mock_expected_related_units, mock_related_units):
-        mock_related_units.return_value = []
-        mock_expected_related_units.return_value = ['service/0']
-        self.assertFalse(
-            hooks._goal_state_achieved_for_relid('aservice', None))
-
-    @patch('charmhelpers.core.hookenv.related_units')
-    @patch('charmhelpers.core.hookenv.expected_related_units')
-    def test__goal_state_achieved_for_relid__goal_state_insufficient_units(
-            self, mock_expected_related_units, mock_related_units):
-        mock_related_units.return_value = ['service/0']
-        mock_expected_related_units.return_value = ['service/0', 'service/1']
-        self.assertFalse(
-            hooks._goal_state_achieved_for_relid('aservice', None))
-
-    @patch('charmhelpers.core.hookenv.related_units')
-    @patch('charmhelpers.core.hookenv.expected_related_units')
-    def test__goal_state_achieved_for_relid__goal_state_sufficient_units(
-            self, mock_expected_related_units, mock_related_units):
-        mock_related_units.return_value = ['service/0', 'service/1']
-        mock_expected_related_units.return_value = ['service/0', 'service/1']
-        self.assertTrue(hooks._goal_state_achieved_for_relid('aservice', None))
-
-    @patch('charmhelpers.core.hookenv.related_units')
-    @patch('charmhelpers.core.hookenv.expected_related_units')
-    def test__goal_state_achieved_for_relid__goal_state_different_units(
-            self, mock_expected_related_units, mock_related_units):
-        # this shouldn't actually be able to happen, but let's check for it
-        # anyway
-        mock_related_units.return_value = ['service/0']
-        mock_expected_related_units.return_value = \
-            ['service-a/0', 'service-b/0']
-        self.assertFalse(
-            hooks._goal_state_achieved_for_relid('aservice', None))
-
-    @patch('hooks.nova_cc_utils.add_authorized_key_if_doesnt_exist')
-    @patch('hooks.nova_cc_utils.ssh_compute_add_known_hosts')
-    @patch('hooks.nova_cc_hooks._goal_state_achieved_for_relid')
-    @patch('hooks.nova_cc_utils.remote_service_from_unit')
-    def test_update_ssh_keys_and_notify_compute_units_ssh_migration(
-            self,
-            mock_remote_service_from_unit,
-            mock__goal_state_achieved_for_relid,
-            mock_ssh_compute_add_known_hosts,
-            mock_add_authorized_key_if_doesnt_exist):
-        mock_remote_service_from_unit.return_value = 'aservice'
-        mock__goal_state_achieved_for_relid.return_value = True
+    @patch.object(hooks, 'is_cellv2_init_ready')
+    @patch.object(hooks, 'is_db_initialised')
+    def test_compute_changed_ssh_migration(self, mock_is_db_initialised,
+                                           mock_is_cellv2_init_ready):
         self.test_relation.set({
             'migration_auth_type': 'ssh', 'ssh_public_key': 'fookey',
             'private-address': '10.0.0.1', 'region': 'RegionOne'})
@@ -443,11 +318,10 @@ class NovaCCHooksTests(CharmTestCase):
             'k_h_0', 'k_h_1', 'k_h_2']
         self.ssh_authorized_keys_lines.return_value = [
             'auth_0', 'auth_1', 'auth_2']
-        hooks.update_ssh_keys_and_notify_compute_units()
-        mock_ssh_compute_add_known_hosts.assert_called_once_with(
-            'aservice', ['10.0.0.1'], user=None)
-        mock_add_authorized_key_if_doesnt_exist.assert_called_once_with(
-            'fookey', 'aservice', '10.0.0.1', user=None)
+        mock_is_db_initialised.return_value = False
+        mock_is_cellv2_init_ready.return_value = False
+        hooks.compute_changed()
+        self.ssh_compute_add.assert_called_with('fookey', rid=None, unit=None)
         expected_relations = [
             call(relation_settings={'authorized_keys_0': 'auth_0'},
                  relation_id=None),
@@ -461,26 +335,15 @@ class NovaCCHooksTests(CharmTestCase):
                  relation_id=None),
             call(relation_settings={'known_hosts_2': 'k_h_2'},
                  relation_id=None),
-            call(relation_settings={'known_hosts_max_index': 3},
-                 relation_id=None),
-            call(relation_settings={'authorized_keys_max_index': 3},
-                 relation_id=None)]
-        self.relation_set.assert_has_calls(expected_relations, any_order=True)
-        mock__goal_state_achieved_for_relid.assert_called_once_with(
-            'cloud-compute', None)
+            call(authorized_keys_max_index=3, relation_id=None),
+            call(known_hosts_max_index=3, relation_id=None)]
+        self.assertEqual(sorted(self.relation_set.call_args_list),
+                         sorted(expected_relations))
 
-    @patch('hooks.nova_cc_utils.add_authorized_key_if_doesnt_exist')
-    @patch('hooks.nova_cc_utils.ssh_compute_add_known_hosts')
-    @patch('hooks.nova_cc_hooks._goal_state_achieved_for_relid')
-    @patch('hooks.nova_cc_utils.remote_service_from_unit')
-    def test_update_ssh_keys_and_notify_compute_units_nova_public_key(
-            self,
-            mock_remote_service_from_unit,
-            mock__goal_state_achieved_for_relid,
-            mock_ssh_compute_add_known_hosts,
-            mock_add_authorized_key_if_doesnt_exist):
-        mock_remote_service_from_unit.return_value = 'aservice'
-        mock__goal_state_achieved_for_relid.return_value = True
+    @patch.object(hooks, 'is_cellv2_init_ready')
+    @patch.object(hooks, 'is_db_initialised')
+    def test_compute_changed_nova_public_key(self, mock_is_db_initialised,
+                                             mock_is_cellv2_init_ready):
         self.test_relation.set({
             'migration_auth_type': 'sasl', 'nova_ssh_public_key': 'fookey',
             'private-address': '10.0.0.1', 'region': 'RegionOne'})
@@ -488,11 +351,11 @@ class NovaCCHooksTests(CharmTestCase):
             'k_h_0', 'k_h_1', 'k_h_2']
         self.ssh_authorized_keys_lines.return_value = [
             'auth_0', 'auth_1', 'auth_2']
-        hooks.update_ssh_keys_and_notify_compute_units()
-        mock_ssh_compute_add_known_hosts.assert_called_once_with(
-            'aservice', ['10.0.0.1'], user='nova')
-        mock_add_authorized_key_if_doesnt_exist.assert_called_once_with(
-            'fookey', 'aservice', '10.0.0.1', user='nova')
+        mock_is_db_initialised.return_value = False
+        mock_is_cellv2_init_ready.return_value = False
+        hooks.compute_changed()
+        self.ssh_compute_add.assert_called_with('fookey', user='nova',
+                                                rid=None, unit=None)
         expected_relations = [
             call(relation_settings={'nova_authorized_keys_0': 'auth_0'},
                  relation_id=None),
@@ -510,45 +373,47 @@ class NovaCCHooksTests(CharmTestCase):
                  relation_id=None),
             call(relation_settings={'nova_authorized_keys_max_index': 3},
                  relation_id=None)]
-        self.relation_set.assert_has_calls(expected_relations, any_order=True)
-        mock__goal_state_achieved_for_relid.assert_called_once_with(
-            'cloud-compute', None)
+        self.assertEqual(sorted(self.relation_set.call_args_list),
+                         sorted(expected_relations))
 
-    @patch('hooks.nova_cc_utils.is_cellv2_init_ready')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
-    @patch('hooks.nova_cc_utils.add_hosts_to_cell')
-    def test_add_hosts_to_cell_when_ready_leader(self,
-                                                 mock_add_hosts_to_cell,
-                                                 mock_is_db_initialised,
-                                                 mock_is_cellv2_init_ready):
+    @patch.object(hooks, 'is_cellv2_init_ready')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'add_hosts_to_cell')
+    def test_compute_changed_add_hosts_leader(self,
+                                              mock_add_hosts_to_cell,
+                                              mock_is_db_initialised,
+                                              mock_is_cellv2_init_ready):
         self.is_leader.return_value = True
         mock_is_db_initialised.return_value = True
         mock_is_cellv2_init_ready.return_value = True
-        hooks.add_hosts_to_cell_when_ready()
+        hooks.compute_changed()
         self.assertTrue(self.is_leader.called)
         self.assertTrue(mock_is_db_initialised.called)
         self.assertTrue(mock_is_cellv2_init_ready.called)
         self.assertTrue(mock_add_hosts_to_cell.called)
 
-    @patch('hooks.nova_cc_utils.is_cellv2_init_ready')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
-    @patch('hooks.nova_cc_utils.add_hosts_to_cell')
-    def test_add_hosts_to_cell_when_ready_nonleader(self,
-                                                    mock_add_hosts_to_cell,
-                                                    mock_is_db_initialised,
-                                                    mock_is_cellv2_init_ready):
+    @patch.object(hooks, 'is_cellv2_init_ready')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'add_hosts_to_cell')
+    def test_compute_changed_add_hosts_nonleader(self,
+                                                 mock_add_hosts_to_cell,
+                                                 mock_is_db_initialised,
+                                                 mock_is_cellv2_init_ready):
         self.is_leader.return_value = False
         mock_is_db_initialised.return_value = True
         mock_is_cellv2_init_ready.return_value = True
-        hooks.add_hosts_to_cell_when_ready()
+        hooks.compute_changed()
         self.assertTrue(self.is_leader.called)
         self.assertFalse(mock_is_db_initialised.called)
         self.assertFalse(mock_is_cellv2_init_ready.called)
         self.assertFalse(mock_add_hosts_to_cell.called)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
+    @patch.object(hooks, 'canonical_url')
+    @patch.object(utils, 'config')
     @patch.object(hooks, '_auth_config')
-    def test_compute_joined_neutron(self, auth_config, _canonical_url):
+    def test_compute_joined_neutron(self, auth_config, _util_config,
+                                    _canonical_url):
+        _util_config.return_value = None
         self.is_relation_made.return_value = False
         self.network_manager.return_value = 'neutron'
         self.is_leader = True
@@ -573,18 +438,19 @@ class NovaCCHooksTests(CharmTestCase):
             serial_console_base_url='ws://controller:6803',
             **FAKE_KS_AUTH_CFG)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
-    @patch('hooks.nova_cc_context.NeutronAPIContext')
+    @patch.object(hooks, 'canonical_url')
+    @patch.object(utils, 'config')
+    @patch.object(hooks, 'NeutronAPIContext')
     @patch.object(hooks, '_auth_config')
     def test_compute_joined_neutron_api_rel(self, auth_config, napi,
-                                            _canonical_url):
+                                            _util_config, _canonical_url):
         def mock_NeutronAPIContext():
             return {
                 'neutron_plugin': 'bob',
                 'neutron_security_groups': 'yes',
                 'neutron_url': 'http://nova-cc-host1:9696',
             }
-
+        _util_config.return_value = None
         napi.return_value = mock_NeutronAPIContext
         self.is_relation_made.return_value = True
         self.network_manager.return_value = 'neutron'
@@ -614,7 +480,7 @@ class NovaCCHooksTests(CharmTestCase):
             serial_console_base_url='ws://controller:6803',
             **FAKE_KS_AUTH_CFG)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
+    @patch.object(hooks, 'canonical_url')
     @patch.object(hooks, '_auth_config')
     def test_nova_vmware_joined(self, auth_config, _canonical_url):
         auth_config.return_value = FAKE_KS_AUTH_CFG
@@ -669,25 +535,23 @@ class NovaCCHooksTests(CharmTestCase):
         self.get_relation_ip.assert_called_with('shared-db',
                                                 cidr_network=None)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
+    @patch('charmhelpers.contrib.openstack.ip.service_name',
+           lambda *args: 'nova-cloud-controller')
+    @patch('charmhelpers.contrib.openstack.ip.unit_get')
     @patch('charmhelpers.contrib.openstack.ip.is_clustered')
-    def test_identity_joined(self, _is_clustered, mock_canonical_url):
+    @patch('charmhelpers.contrib.openstack.ip.config')
+    def test_identity_joined(self, _ip_config, _is_clustered, _unit_get):
         _is_clustered.return_value = False
-        mock_canonical_url.side_effect = [
-            'http://ncc.example.com',
-            'http://127.0.0.1',
-            'http://127.0.0.2',
-        ]
+        _unit_get.return_value = '127.0.0.1'
+        _ip_config.side_effect = self.test_config.get
+
         self.test_config.set('os-public-hostname', 'ncc.example.com')
         hooks.identity_joined()
-        mock_canonical_url.assert_has_calls([
-            call(hooks.CONFIGS, hooks.ch_ip.PUBLIC),
-            call(hooks.CONFIGS, hooks.ch_ip.INTERNAL),
-            call(hooks.CONFIGS, hooks.ch_ip.ADMIN)])
-        self.determine_endpoints.assert_called_with(
-            'http://ncc.example.com',
-            'http://127.0.0.1',
-            'http://127.0.0.2'
+
+        self.determine_endpoints.asssert_called_with(
+            public_url='http://ncc.example.com',
+            internal_url='http://127.0.0.1',
+            admin_url='http://127.0.0.1'
         )
 
     def test_identity_joined_partial_cluster(self):
@@ -696,11 +560,8 @@ class NovaCCHooksTests(CharmTestCase):
         hooks.identity_joined()
         self.assertFalse(self.relation_set.called)
 
-    @patch.object(utils, 'resource_map')
     @patch.object(hooks, 'CONFIGS')
-    def test_db_changed_missing_relation_data(
-            self, configs, mock_resource_map):
-        mock_resource_map.return_value = {}
+    def test_db_changed_missing_relation_data(self, configs):
         configs.complete_contexts = MagicMock()
         configs.complete_contexts.return_value = []
         hooks.db_changed()
@@ -714,44 +575,43 @@ class NovaCCHooksTests(CharmTestCase):
         configs.write = MagicMock()
         hooks.db_changed()
 
-    @patch.object(utils, 'resource_map')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
+    @patch.object(hooks, 'nova_api_relation_joined')
+    @patch.object(hooks, 'is_db_initialised')
     @patch.object(hooks, 'CONFIGS')
     def test_db_changed(self, configs,
-                        mock_is_db_initialised, mock_resource_map):
+                        mock_is_db_initialised, api_joined):
+        self.relation_ids.return_value = ['nova-api/0']
         mock_is_db_initialised.return_value = False
-        mock_resource_map.return_value = {}
         'No database migration is attempted when ACL list is not present'
         self.os_release.return_value = 'diablo'
         self._shared_db_test(configs)
         self.assertTrue(configs.write_all.called)
         self.assertFalse(self.migrate_nova_databases.called)
+        api_joined.asert_called_with(rid='nova-api/0')
 
-    @patch.object(utils, 'resource_map')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
+    @patch.object(utils, 'is_leader')
+    @patch.object(utils, 'os_release')
+    @patch.object(hooks, 'is_db_initialised')
     @patch.object(hooks, 'CONFIGS')
     def test_db_changed_allowed(self, configs, mock_is_db_initialised,
-                                mock_resource_map):
+                                utils_os_release, utils_is_leader):
         mock_is_db_initialised.return_value = False
-        mock_resource_map.return_value = {}
         allowed_units = 'nova-cloud-controller/0 nova-cloud-controller/3'
         self.test_relation.set({
             'nova_allowed_units': allowed_units,
         })
         self.local_unit.return_value = 'nova-cloud-controller/3'
         self.os_release.return_value = 'diablo'
-        self.is_leader.return_value = True
+        utils_os_release.return_value = 'diablo'
+        utils_is_leader.return_value = False
         self._shared_db_test(configs)
         self.assertTrue(configs.write_all.called)
         self.migrate_nova_databases.assert_called_with()
 
-    @patch.object(utils, 'resource_map')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
+    @patch.object(hooks, 'is_db_initialised')
     @patch.object(hooks, 'CONFIGS')
-    def test_db_changed_not_allowed(self, configs, mock_is_db_initialised,
-                                    mock_resource_map):
+    def test_db_changed_not_allowed(self, configs, mock_is_db_initialised):
         mock_is_db_initialised.return_value = False
-        mock_resource_map.return_value = {}
         allowed_units = 'nova-cloud-controller/0 nova-cloud-controller/3'
         self.test_relation.set({
             'nova_allowed_units': allowed_units,
@@ -762,22 +622,23 @@ class NovaCCHooksTests(CharmTestCase):
         self.assertTrue(configs.write_all.called)
         self.assertFalse(self.migrate_nova_databases.called)
 
-    @patch.object(utils, 'resource_map')
+    @patch.object(utils, 'is_leader')
+    @patch.object(utils, 'os_release')
     @patch.object(hooks, 'quantum_joined')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'nova_cell_relation_joined')
     @patch.object(hooks, 'compute_joined')
     @patch.object(hooks, 'CONFIGS')
     def test_db_changed_remote_restarts(self, configs, comp_joined,
-                                        mock_is_db_initialised,
-                                        quantum_joined,
-                                        mock_resource_map):
+                                        cell_joined, mock_is_db_initialised,
+                                        quantum_joined, utils_os_release,
+                                        utils_is_leader):
         mock_is_db_initialised.return_value = False
-        mock_resource_map.return_value = {}
 
         def _relation_ids(rel):
             relid = {
                 'cloud-compute': ['nova-compute/0'],
-                'nova-cell-api': ['nova-cell-controller/0'],
+                'cell': ['nova-cell-api/0'],
                 'neutron-api': ['neutron-api/0'],
                 'quantum-network-service': ['neutron-gateway/0']
             }
@@ -789,35 +650,39 @@ class NovaCCHooksTests(CharmTestCase):
         })
         self.local_unit.return_value = 'nova-cloud-controller/0'
         self.os_release.return_value = 'diablo'
-        self.is_leader.return_value = True
+        utils_os_release.return_value = 'diablo'
+        utils_is_leader.return_value = False
         self._shared_db_test(configs)
         comp_joined.assert_called_with(remote_restart=True,
                                        rid='nova-compute/0')
+        cell_joined.assert_called_with(remote_restart=True,
+                                       rid='nova-cell-api/0')
         quantum_joined.assert_called_with(remote_restart=True,
                                           rid='neutron-gateway/0')
         self.migrate_nova_databases.assert_called_with()
 
+    @patch.object(hooks, 'nova_cell_relation_joined')
     @patch.object(hooks, 'CONFIGS')
-    def test_amqp_relation_broken(self, configs):
+    def test_amqp_relation_broken(self, configs, cell_joined):
         configs.write = MagicMock()
         self.relation_ids.return_value = ['nova-cell-api/0']
         hooks.relation_broken()
         self.assertTrue(configs.write_all.called)
+        cell_joined.assert_called_with(rid='nova-cell-api/0')
 
-    @patch.object(hooks, 'update_child_cell_records')
-    @patch.object(utils, 'resource_map')
     @patch.object(hooks, 'leader_init_db_if_ready_allowed_units')
     @patch.object(hooks, 'update_cell_db_if_ready_allowed_units')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
+    @patch.object(hooks, 'is_db_initialised')
     @patch.object(hooks, 'quantum_joined')
+    @patch.object(hooks, 'nova_api_relation_joined')
+    @patch.object(hooks, 'nova_cell_relation_joined')
     @patch.object(hooks, 'CONFIGS')
-    def test_amqp_changed_api_rel(self, configs,
+    def test_amqp_changed_api_rel(self, configs, cell_joined, api_joined,
                                   quantum_joined, mock_is_db_initialised,
-                                  update_db_allowed, init_db_allowed,
-                                  mock_resource_map,
-                                  mock_update_child_cell_records):
-        mock_resource_map.return_value = {}
+                                  update_db_allowed, init_db_allowed):
         self.relation_ids.side_effect = [
+            ['nova-cell-api/0'],
+            ['nova-api/0'],
             ['quantum-service/0'],
         ]
         mock_is_db_initialised.return_value = False
@@ -829,30 +694,28 @@ class NovaCCHooksTests(CharmTestCase):
         hooks.amqp_changed()
         self.assertEqual(configs.write.call_args_list,
                          [call('/etc/nova/nova.conf')])
+        cell_joined.assert_called_with(rid='nova-cell-api/0')
+        api_joined.assert_called_with(rid='nova-api/0')
         quantum_joined.assert_called_with(rid='quantum-service/0',
                                           remote_restart=True)
 
-    @patch.object(hooks, 'update_child_cell_records')
     @patch.object(hooks, 'leader_init_db_if_ready_allowed_units')
     @patch.object(hooks, 'update_cell_db_if_ready_allowed_units')
-    @patch.object(utils, 'resource_map')
-    @patch('hooks.nova_cc_utils.is_db_initialised')
+    @patch.object(hooks, 'is_db_initialised')
     @patch.object(hooks, 'quantum_joined')
+    @patch.object(hooks, 'nova_api_relation_joined')
+    @patch.object(hooks, 'nova_cell_relation_joined')
     @patch.object(hooks, 'CONFIGS')
-    def test_amqp_changed_noapi_rel(self,
-                                    configs,
-                                    quantum_joined,
-                                    mock_is_db_initialised,
-                                    mock_resource_map,
-                                    update_db_allowed,
-                                    init_db_allowed,
-                                    mock_update_child_cell_records):
-        mock_resource_map.return_value = {}
+    def test_amqp_changed_noapi_rel(self, configs, cell_joined, api_joined,
+                                    quantum_joined, mock_is_db_initialised,
+                                    update_db_allowed, init_db_allowed):
         mock_is_db_initialised.return_value = False
         configs.complete_contexts = MagicMock()
         configs.complete_contexts.return_value = ['amqp']
         configs.write = MagicMock()
         self.relation_ids.side_effect = [
+            ['nova-cell-api/0'],
+            ['nova-api/0'],
             ['quantum-service/0'],
         ]
         self.is_relation_made.return_value = False
@@ -861,31 +724,56 @@ class NovaCCHooksTests(CharmTestCase):
         hooks.amqp_changed()
         self.assertEqual(configs.write.call_args_list,
                          [call('/etc/nova/nova.conf')])
+        cell_joined.assert_called_with(rid='nova-cell-api/0')
+        api_joined.assert_called_with(rid='nova-api/0')
         quantum_joined.assert_called_with(rid='quantum-service/0',
                                           remote_restart=True)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
+    @patch.object(hooks, 'canonical_url')
+    def test_nova_cell_relation_joined(self, _canonical_url):
+        self.uuid.uuid4.return_value = 'bob'
+        _canonical_url.return_value = 'http://novaurl'
+        hooks.nova_cell_relation_joined(rid='rid',
+                                        remote_restart=True)
+        self.relation_set.assert_called_with(restart_trigger='bob',
+                                             nova_url='http://novaurl:8774/v2',
+                                             relation_id='rid')
+
+    @patch.object(hooks, 'CONFIGS')
+    def test_nova_cell_relation_changed(self, configs):
+        hooks.nova_cell_relation_changed()
+        configs.write.assert_called_with('/etc/nova/nova.conf')
+
+    def test_get_cell_type(self):
+        self.NovaCellContext().return_value = {
+            'cell_type': 'parent',
+            'cell_name': 'api',
+        }
+        self.assertEqual(hooks.get_cell_type(), 'parent')
+
+    @patch.object(hooks, 'canonical_url')
     @patch.object(os, 'rename')
     @patch.object(os.path, 'isfile')
     @patch.object(hooks, 'CONFIGS')
-    def test_neutron_api_relation_joined(self, configs, isfile,
+    @patch.object(hooks, 'get_cell_type')
+    def test_neutron_api_relation_joined(self, get_cell_type, configs, isfile,
                                          rename, _canonical_url):
         nova_url = 'http://novaurl:8774/v2'
         isfile.return_value = True
         _identity_joined = self.patch('identity_joined')
         self.relation_ids.return_value = ['relid']
         _canonical_url.return_value = 'http://novaurl'
+        get_cell_type.return_value = 'parent'
         self.uuid.uuid4.return_value = 'bob'
         hooks.neutron_api_relation_joined(remote_restart=True)
         self.assertTrue(_identity_joined.called)
         self.relation_set.assert_called_with(relation_id=None,
+                                             cell_type='parent',
                                              nova_url=nova_url,
                                              restart_trigger='bob')
 
-    @patch('hooks.nova_cc_utils.resource_map')
     @patch.object(hooks, 'CONFIGS')
-    def test_neutron_api_relation_changed(self, configs, mock_resource_map):
-        mock_resource_map.return_value = {}
+    def test_neutron_api_relation_changed(self, configs):
         self.relation_ids.return_value = ['relid']
         _compute_joined = self.patch('compute_joined')
         _quantum_joined = self.patch('quantum_joined')
@@ -894,13 +782,10 @@ class NovaCCHooksTests(CharmTestCase):
         self.assertTrue(_compute_joined.called)
         self.assertTrue(_quantum_joined.called)
 
-    @patch.object(utils, 'resource_map')
     @patch.object(os, 'remove')
     @patch.object(os.path, 'isfile')
     @patch.object(hooks, 'CONFIGS')
-    def test_neutron_api_relation_broken(self, configs, isfile, remove,
-                                         mock_resource_map):
-        mock_resource_map.return_value = {}
+    def test_neutron_api_relation_broken(self, configs, isfile, remove):
         isfile.return_value = True
         self.relation_ids.return_value = ['relid']
         _compute_joined = self.patch('compute_joined')
@@ -910,15 +795,12 @@ class NovaCCHooksTests(CharmTestCase):
         self.assertTrue(_compute_joined.called)
         self.assertTrue(_quantum_joined.called)
 
-    @patch.object(utils, 'resource_map')
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
-    def test_console_settings_vnc(self, _canonical_url, mock_resource_map):
-        self.test_config.set('console-access-protocol', 'vnc')
-        self.os_release.return_value = 'kilo'
-        mock_resource_map.return_value = {}
+    @patch.object(hooks, 'canonical_url')
+    @patch.object(utils, 'config')
+    def test_console_settings_vnc(self, _utils_config, _canonical_url):
+        _utils_config.return_value = 'vnc'
         _cc_host = "nova-cc-host1"
         _canonical_url.return_value = 'http://' + _cc_host
-        hooks.resolve_CONFIGS()
         _con_sets = hooks.console_settings()
         console_settings = {
             'console_proxy_novnc_address': 'http://%s:6080/vnc_auto.html' %
@@ -934,9 +816,10 @@ class NovaCCHooksTests(CharmTestCase):
         }
         self.assertEqual(_con_sets, console_settings)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
-    def test_console_settings_xvpvnc(self, _canonical_url):
-        self.test_config.set('console-access-protocol', 'xvpvnc')
+    @patch.object(hooks, 'canonical_url')
+    @patch.object(utils, 'config')
+    def test_console_settings_xvpvnc(self, _utils_config, _canonical_url):
+        _utils_config.return_value = 'xvpvnc'
         _cc_host = "nova-cc-host1"
         _canonical_url.return_value = 'http://' + _cc_host
         _con_sets = hooks.console_settings()
@@ -950,9 +833,10 @@ class NovaCCHooksTests(CharmTestCase):
         }
         self.assertEqual(_con_sets, console_settings)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
-    def test_console_settings_novnc(self, _canonical_url):
-        self.test_config.set('console-access-protocol', 'novnc')
+    @patch.object(hooks, 'canonical_url')
+    @patch.object(utils, 'config')
+    def test_console_settings_novnc(self, _utils_config, _canonical_url):
+        _utils_config.return_value = 'novnc'
         _cc_host = "nova-cc-host1"
         _canonical_url.return_value = 'http://' + _cc_host
         _con_sets = hooks.console_settings()
@@ -966,9 +850,10 @@ class NovaCCHooksTests(CharmTestCase):
         }
         self.assertEqual(_con_sets, console_settings)
 
-    @patch('charmhelpers.contrib.openstack.ip.canonical_url')
-    def test_console_settings_spice(self, _canonical_url):
-        self.test_config.set('console-access-protocol', 'spice')
+    @patch.object(hooks, 'canonical_url')
+    @patch.object(utils, 'config')
+    def test_console_settings_spice(self, _utils_config, _canonical_url):
+        _utils_config.return_value = 'spice'
         _cc_host = "nova-cc-host1"
         _canonical_url.return_value = 'http://' + _cc_host
         _con_sets = hooks.console_settings()
@@ -982,9 +867,10 @@ class NovaCCHooksTests(CharmTestCase):
         }
         self.assertEqual(_con_sets, console_settings)
 
-    @patch('charmhelpers.contrib.hahelpers.cluster.https')
-    def test_console_settings_explicit_ip(self, _https):
-        self.test_config.set('console-access-protocol', 'spice')
+    @patch.object(hooks, 'https')
+    @patch.object(utils, 'config')
+    def test_console_settings_explicit_ip(self, _utils_config, _https):
+        _utils_config.return_value = 'spice'
         _https.return_value = False
         _cc_public_host = "public-host"
         self.test_config.set('console-proxy-ip', _cc_public_host)
@@ -999,9 +885,11 @@ class NovaCCHooksTests(CharmTestCase):
         }
         self.assertEqual(_con_sets, console_settings)
 
-    @patch('charmhelpers.contrib.hahelpers.cluster.https')
-    def test_console_settings_explicit_ip_with_https(self, _https):
-        self.test_config.set('console-access-protocol', 'spice')
+    @patch.object(hooks, 'https')
+    @patch.object(utils, 'config')
+    def test_console_settings_explicit_ip_with_https(self, _utils_config,
+                                                     _https):
+        _utils_config.return_value = 'spice'
         _https.return_value = True
         _cc_public_host = "public-host"
         self.test_config.set('console-proxy-ip', _cc_public_host)
@@ -1016,30 +904,212 @@ class NovaCCHooksTests(CharmTestCase):
         }
         self.assertEqual(_con_sets, console_settings)
 
-    def test_ha_relation_joined(self):
-        self.test_config.set('dns-ha', False)
-        self.generate_ha_relation_data.return_value = {'ha': 'settings'}
+    @patch('nova_cc_utils.config')
+    def test_ha_relation_joined_no_bound_ip(self, config):
+        self.get_hacluster_config.return_value = {
+            'ha-bindiface': 'em0',
+            'ha-mcastport': '8080',
+            'vip': '10.10.10.10',
+        }
+        self.test_config.set('vip_iface', 'eth120')
+        self.test_config.set('vip_cidr', '21')
+        config.return_value = None
+        self.get_iface_for_address.return_value = None
+        self.get_netmask_for_address.return_value = None
         hooks.ha_joined()
-        self.generate_ha_relation_data.assert_called_once_with(
-            'nova',
-            extra_settings={'delete_resources': ['vip_consoleauth',
-                                                 'res_nova_consoleauth']})
-        self.relation_set.assert_called_once_with(
-            ha='settings',
-            relation_id=None)
+        args = {
+            'relation_id': None,
+            'corosync_bindiface': 'em0',
+            'corosync_mcastport': '8080',
+            'init_services': {'res_nova_haproxy': 'haproxy'},
+            'resources': {'res_nova_eth120_vip': 'ocf:heartbeat:IPaddr2',
+                          'res_nova_haproxy': 'lsb:haproxy'},
+            'resource_params': {
+                'res_nova_eth120_vip': 'params ip="10.10.10.10"'
+                ' cidr_netmask="21" nic="eth120"',
+                'res_nova_haproxy': 'op monitor interval="5s"'},
+            'colocations': {},
+            'clones': {'cl_nova_haproxy': 'res_nova_haproxy'}
+        }
+        self.relation_set.assert_has_calls([
+            call(groups={'grp_nova_vips': 'res_nova_eth120_vip'}),
+            call(**args),
+        ])
 
-    def test_ha_relation_joined_dnsha(self):
-        self.test_config.set('console-access-protocol', 'novnc')
+    def test_ha_joined_dns_ha(self):
+        def _fake_update(resources, resource_params, relation_id=None):
+            resources.update({'res_nova_public_hostname': 'ocf:maas:dns'})
+            resource_params.update({'res_nova_public_hostname':
+                                    'params fqdn="nova.maas" '
+                                    'ip_address="10.0.0.1"'})
+
         self.test_config.set('dns-ha', True)
-        self.generate_ha_relation_data.return_value = {'ha': 'settings'}
+        self.get_hacluster_config.return_value = {
+            'vip': None,
+            'ha-bindiface': 'em0',
+            'ha-mcastport': '8080',
+            'os-admin-hostname': None,
+            'os-internal-hostname': None,
+            'os-public-hostname': 'nova.maas',
+        }
+        args = {
+            'relation_id': None,
+            'corosync_bindiface': 'em0',
+            'corosync_mcastport': '8080',
+            'init_services': {'res_nova_haproxy': 'haproxy'},
+            'resources': {'res_nova_public_hostname': 'ocf:maas:dns',
+                          'res_nova_haproxy': 'lsb:haproxy'},
+            'resource_params': {
+                'res_nova_public_hostname': 'params fqdn="nova.maas" '
+                                            'ip_address="10.0.0.1"',
+                'res_nova_haproxy': 'op monitor interval="5s"'},
+            'clones': {'cl_nova_haproxy': 'res_nova_haproxy'},
+            'colocations': {},
+        }
+        self.update_dns_ha_resource_params.side_effect = _fake_update
+
         hooks.ha_joined()
-        self.generate_ha_relation_data.assert_called_once_with(
-            'nova',
-            extra_settings={'delete_resources': ['vip_consoleauth',
-                                                 'res_nova_consoleauth']})
-        self.relation_set.assert_called_once_with(
-            ha='settings',
-            relation_id=None)
+        self.assertTrue(self.update_dns_ha_resource_params.called)
+        self.relation_set.assert_called_with(**args)
+
+    @patch('nova_cc_utils.config')
+    def test_ha_relation_multi_consoleauth(self, config):
+        self.get_hacluster_config.return_value = {
+            'ha-bindiface': 'em0',
+            'ha-mcastport': '8080',
+            'vip': '10.10.10.10',
+        }
+        self.test_config.set('vip_iface', 'eth120')
+        self.test_config.set('vip_cidr', '21')
+        self.test_config.set('single-nova-consoleauth', False)
+        config.return_value = 'novnc'
+        self.get_iface_for_address.return_value = None
+        self.get_netmask_for_address.return_value = None
+        hooks.ha_joined()
+        args = {
+            'relation_id': None,
+            'corosync_bindiface': 'em0',
+            'corosync_mcastport': '8080',
+            'init_services': {'res_nova_haproxy': 'haproxy'},
+            'resources': {'res_nova_eth120_vip': 'ocf:heartbeat:IPaddr2',
+                          'res_nova_haproxy': 'lsb:haproxy'},
+            'resource_params': {
+                'res_nova_eth120_vip': 'params ip="10.10.10.10"'
+                ' cidr_netmask="21" nic="eth120"',
+                'res_nova_haproxy': 'op monitor interval="5s"'},
+            'colocations': {},
+            'clones': {'cl_nova_haproxy': 'res_nova_haproxy'}
+        }
+        self.relation_set.assert_has_calls([
+            call(groups={'grp_nova_vips': 'res_nova_eth120_vip'}),
+            call(**args),
+        ])
+
+    @patch('nova_cc_utils.config')
+    def test_ha_relation_single_consoleauth(self, config):
+        self.get_hacluster_config.return_value = {
+            'ha-bindiface': 'em0',
+            'ha-mcastport': '8080',
+            'vip': '10.10.10.10',
+        }
+        self.test_config.set('vip_iface', 'eth120')
+        self.test_config.set('vip_cidr', '21')
+        config.return_value = 'novnc'
+        self.get_iface_for_address.return_value = None
+        self.get_netmask_for_address.return_value = None
+        hooks.ha_joined()
+        args = {
+            'relation_id': None,
+            'corosync_bindiface': 'em0',
+            'corosync_mcastport': '8080',
+            'init_services': {'res_nova_haproxy': 'haproxy',
+                              'res_nova_consoleauth': 'nova-consoleauth'},
+            'resources': {'res_nova_eth120_vip': 'ocf:heartbeat:IPaddr2',
+                          'res_nova_haproxy': 'lsb:haproxy',
+                          'res_nova_consoleauth':
+                          'ocf:openstack:nova-consoleauth'},
+            'resource_params': {
+                'res_nova_eth120_vip': 'params ip="10.10.10.10"'
+                ' cidr_netmask="21" nic="eth120"',
+                'res_nova_haproxy': 'op monitor interval="5s"',
+                'res_nova_consoleauth': 'op monitor interval="5s"'},
+            'colocations': {
+                'vip_consoleauth': 'inf: res_nova_consoleauth grp_nova_vips'
+            },
+            'clones': {'cl_nova_haproxy': 'res_nova_haproxy'}
+        }
+        self.relation_set.assert_has_calls([
+            call(groups={'grp_nova_vips': 'res_nova_eth120_vip'}),
+            call(**args),
+        ])
+
+    @patch.object(hooks, 'update_aws_compat_services')
+    @patch.object(hooks, 'is_db_initialised')
+    @patch.object(hooks, 'determine_packages')
+    @patch.object(hooks, 'service_pause')
+    @patch.object(hooks, 'filter_installed_packages')
+    @patch('nova_cc_hooks.configure_https')
+    @patch('nova_cc_utils.config')
+    def test_config_changed_single_consoleauth(self, mock_config,
+                                               mock_configure_https,
+                                               mock_filter_packages,
+                                               mock_service_pause,
+                                               mock_determine_packages,
+                                               mock_is_db_initialised,
+                                               mock_update_aws_compat_svcs):
+        mock_determine_packages.return_value = []
+        mock_is_db_initialised.return_value = False
+        self.config_value_changed.return_value = False
+        self.os_release.return_value = 'diablo'
+
+        def cfg(k, v):
+            if k == "single-nova-authconsole":
+                return True
+            return 'novnc'
+
+        config.side_effect = cfg
+        rids = {'ha': ['ha:1']}
+
+        def f(r):
+            return rids.get(r, [])
+
+        self.relation_ids.side_effect = f
+        hooks.config_changed()
+        args = {
+            'delete_resources': [],
+            'init_services': {'res_nova_consoleauth': 'nova-consoleauth'},
+            'resources': {'res_nova_consoleauth':
+                          'ocf:openstack:nova-consoleauth'},
+            'resource_params': {
+                'res_nova_consoleauth': 'op monitor interval="5s"'},
+            'colocations': {
+                'vip_consoleauth': 'inf: res_nova_consoleauth grp_nova_vips'
+            }
+        }
+        self.relation_set.assert_has_calls([
+            call(v, **args) for v in rids['ha']
+        ])
+
+        mock_service_pause.assert_has_calls([
+            call('nova-consoleauth')]
+        )
+        mock_filter_packages.assert_called_with([])
+
+        self.assertTrue(mock_update_aws_compat_svcs.called)
+
+    @patch.object(hooks, 'is_api_ready')
+    def _test_nova_api_relation_joined(self, tgt, is_api_ready):
+        is_api_ready.return_value = tgt
+        exp = 'yes' if tgt else 'no'
+        hooks.nova_api_relation_joined(rid='foo')
+        self.relation_set.assert_called_with(
+            'foo', **{'nova-api-ready': exp})
+
+    def test_nova_api_relation_joined_ready(self):
+        self._test_nova_api_relation_joined(True)
+
+    def test_nova_api_relation_joined_not_ready(self):
+        self._test_nova_api_relation_joined(False)
 
     @patch.object(hooks, 'memcached_common')
     def test_memcache_joined(self, _memcached_common):
@@ -1050,23 +1120,3 @@ class NovaCCHooksTests(CharmTestCase):
             relation_id=None,
             relation_settings={'private-address': 'foo'})
         hooks.memcached_joined()
-
-    @patch.object(utils, 'resource_map')
-    @patch.object(hooks, 'quantum_joined')
-    @patch.object(hooks, 'compute_joined')
-    @patch.object(hooks, 'configure_https')
-    @patch.object(hooks.cert_utils, 'process_certificates')
-    def test_certs_changed(self, process_certificates, configure_https,
-                           compute_joined, quantum_joined, resource_map):
-        resource_map.return_value = {}
-        self.os_release.return_value = 'rocky'
-        relids = [['relid2'], ['relid1']]
-        self.relation_ids.side_effect = lambda x: relids.pop()
-        hooks.certs_changed()
-        process_certificates.assert_called_once_with('nova', None, None,
-                                                     group='nova')
-        configure_https.assert_called_once_with()
-        compute_joined.assert_called_once_with(remote_restart=False,
-                                               rid='relid1')
-        quantum_joined.assert_called_once_with(remote_restart=False,
-                                               rid='relid2')
