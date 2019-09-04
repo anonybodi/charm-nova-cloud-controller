@@ -1,0 +1,2 @@
+monkey_patch = True
+monkey_patch_modules=nova_sriov_nics.nova_patch:nova_sriov_nics.nova_patch.dummy_decorator
